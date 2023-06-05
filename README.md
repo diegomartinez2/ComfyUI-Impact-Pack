@@ -114,7 +114,7 @@ This takes latent as input and outputs latent as the result.
 
 # How to use (DDetailer feature)
 
-#### 1. Basic auto face detection and refine exapmle.
+#### 1. Basic auto face detection and refine example.
 ![simple](https://github.com/ltdrdata/ComfyUI-extension-tutorials/raw/Main/ComfyUI-Impact-Pack/images/simple.png)
 * The face that has been damaged due to low resolution is restored with high resolution by generating and synthesizing it, in order to restore the details.
 * The FaceDetailer node is a combination of a Detector node for face detection and a Detailer node for image enhancement. See the [Advanced Tutorial](https://github.com/ltdrdata/ComfyUI-extension-tutorials/raw/Main/ComfyUI-Impact-Pack/tutorial/advanced.md) for a more detailed explanation.
