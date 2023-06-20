@@ -6,10 +6,15 @@ import comfy.sd
 import warnings
 from segment_anything import sam_model_registry
 
-from impact_utils import *
-import impact_core as core
-from impact_core import SEG, NO_BBOX_DETECTOR, NO_SEGM_DETECTOR
-from impact_config import MAX_RESOLUTION
+from impact.utils import *
+import impact.core as core
+from impact.core import SEG, NO_BBOX_DETECTOR, NO_SEGM_DETECTOR
+from impact.config import MAX_RESOLUTION
+from PIL import Image
+import numpy as np
+import hashlib
+import json
+import safetensors.torch
 
 warnings.filterwarnings('ignore', category=UserWarning, message='TypedStorage is deprecated')
 
@@ -137,6 +142,136 @@ class ONNXDetectorForEach:
         return (segs, )
 
 
+class SEGSDetailer:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+                     "image": ("IMAGE", ),
+                     "segs": ("SEGS", ),
+                     "guide_size": ("FLOAT", {"default": 256, "min": 64, "max": nodes.MAX_RESOLUTION, "step": 8}),
+                     "guide_size_for": (["bbox", "crop_region"],),
+                     "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
+                     "steps": ("INT", {"default": 20, "min": 1, "max": 10000}),
+                     "cfg": ("FLOAT", {"default": 8.0, "min": 0.0, "max": 100.0}),
+                     "sampler_name": (comfy.samplers.KSampler.SAMPLERS,),
+                     "scheduler": (comfy.samplers.KSampler.SCHEDULERS,),
+                     "denoise": ("FLOAT", {"default": 0.5, "min": 0.0001, "max": 1.0, "step": 0.01}),
+                     "noise_mask": (["enabled", "disabled"], ),
+                     "force_inpaint": (["disabled", "enabled"], ),
+                     "basic_pipe": ("BASIC_PIPE",),
+                     },
+                }
+
+    RETURN_TYPES = ("SEGS", )
+    FUNCTION = "doit"
+
+    CATEGORY = "ImpactPack/Detailer"
+
+    @staticmethod
+    def do_detail(image, segs, guide_size, guide_size_for, seed, steps, cfg, sampler_name, scheduler,
+                  denoise, noise_mask, force_inpaint, basic_pipe):
+
+        model, _, vae, positive, negative = basic_pipe
+
+        image_pil = tensor2pil(image).convert('RGBA')
+
+        new_segs = []
+
+        for seg in segs[1]:
+            cropped_image = seg.cropped_image if seg.cropped_image is not None \
+                                              else crop_ndarray4(image.numpy(), seg.crop_region)
+
+            if noise_mask == "enabled":
+                cropped_mask = seg.cropped_mask
+            else:
+                cropped_mask = None
+
+            enhanced_pil = core.enhance_detail(cropped_image, model, vae, guide_size, guide_size_for, seg.bbox,
+                                               seed, steps, cfg, sampler_name, scheduler,
+                                               positive, negative, denoise, cropped_mask, force_inpaint == "enabled")
+
+            new_seg = seg._replace(cropped_image=enhanced_pil)
+            new_segs.append(new_seg)
+
+        return segs[0], new_segs
+
+    def doit(self, image, segs, guide_size, guide_size_for, seed, steps, cfg, sampler_name, scheduler,
+             denoise, noise_mask, force_inpaint, basic_pipe):
+
+        segs = SEGSDetailer.do_detail(image, segs, guide_size, guide_size_for, seed, steps, cfg, sampler_name, scheduler,
+                                      denoise, noise_mask, force_inpaint, basic_pipe)
+
+        return (segs, )
+
+
+class SEGSPaste:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+                     "image": ("IMAGE", ),
+                     "segs": ("SEGS", ),
+                     "feather": ("INT", {"default": 5, "min": 0, "max": 100, "step": 1}),
+                     },
+                }
+
+    RETURN_TYPES = ("IMAGE", )
+    FUNCTION = "doit"
+
+    CATEGORY = "ImpactPack/Detailer"
+
+    @staticmethod
+    def doit(image, segs, feather):
+        image_pil = tensor2pil(image).convert('RGBA')
+
+        for seg in segs[1]:
+            if seg.cropped_image is not None:
+                mask_pil = feather_mask(seg.cropped_mask, feather)
+                image_pil.paste(seg.cropped_image, (seg.crop_region[0], seg.crop_region[1]), mask_pil)
+
+        image_tensor = pil2tensor(image_pil.convert('RGB'))
+
+        return (image_tensor, )
+
+
+class SEGSPreview:
+    def __init__(self):
+        self.output_dir = folder_paths.get_temp_directory()
+        self.type = "temp"
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+                     "segs": ("SEGS", ),
+                     },
+                }
+
+    RETURN_TYPES = ()
+    FUNCTION = "doit"
+
+    CATEGORY = "ImpactPack/Detailer"
+
+    OUTPUT_NODE = True
+
+    def doit(self, segs):
+        full_output_folder, filename, counter, subfolder, filename_prefix = \
+            folder_paths.get_save_image_path("impact_seg_preview", self.output_dir, segs[0][1], segs[0][0])
+
+        results = list()
+
+        for seg in segs[1]:
+            if seg.cropped_image is not None:
+                file = f"{filename}_{counter:05}_.webp"
+                seg.cropped_image.save(os.path.join(full_output_folder, file))
+                results.append({
+                    "filename": file,
+                    "subfolder": subfolder,
+                    "type": self.type
+                })
+            counter += 1
+
+        return {"ui": {"images": results}}
+
+
 class DetailerForEach:
     @classmethod
     def INPUT_TYPES(s):
@@ -172,6 +307,9 @@ class DetailerForEach:
 
         image_pil = tensor2pil(image).convert('RGBA')
 
+        enhanced_list = []
+        cropped_list = []
+
         for seg in segs[1]:
             cropped_image = seg.cropped_image if seg.cropped_image is not None \
                                               else crop_ndarray4(image.numpy(), seg.crop_region)
@@ -191,14 +329,16 @@ class DetailerForEach:
                 # don't latent composite-> converting to latent caused poor quality
                 # use image paste
                 image_pil.paste(enhanced_pil, (seg.crop_region[0], seg.crop_region[1]), mask_pil)
+                enhanced_list.append(np.squeeze(pil2tensor(enhanced_pil)))
+
+            cropped_list.append(np.squeeze(torch.from_numpy(cropped_image)))
 
         image_tensor = pil2tensor(image_pil.convert('RGB'))
 
-        if len(segs[1]) > 0:
-            enhanced_tensor = pil2tensor(enhanced_pil) if enhanced_pil is not None else image_tensor
-            return image_tensor, torch.from_numpy(cropped_image), enhanced_tensor,
-        else:
-            return image_tensor, image_tensor, image_tensor,
+        cropped_list.sort(key=lambda x: x.shape, reverse=True)
+        enhanced_list.sort(key=lambda x: x.shape, reverse=True)
+
+        return image_tensor, NonListIterable(cropped_list), NonListIterable(enhanced_list)
 
     def doit(self, image, segs, model, vae, guide_size, guide_size_for, seed, steps, cfg, sampler_name, scheduler,
              positive, negative, denoise, feather, noise_mask, force_inpaint):
@@ -1203,12 +1343,29 @@ class SubtractMask:
 
 import nodes
 
+def get_image_hash(arr):
+    split_index1 = arr.shape[0] // 2
+    split_index2 = arr.shape[1] // 2
+    part1 = arr[:split_index1, :split_index2]
+    part2 = arr[:split_index1, split_index2:]
+    part3 = arr[split_index1:, :split_index2]
+    part4 = arr[split_index1:, split_index2:]
+
+    # 각 부분을 합산
+    sum1 = np.sum(part1)
+    sum2 = np.sum(part2)
+    sum3 = np.sum(part3)
+    sum4 = np.sum(part4)
+
+    return hash((sum1, sum2, sum3, sum4))
+
+preview_hash_map = {}
 
 class PreviewBridge(nodes.PreviewImage):
     @classmethod
     def INPUT_TYPES(s):
         return {"required": {"images": ("IMAGE",), },
-                "hidden": {"prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO", },
+                "hidden": {"prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO", "unique_id": "UNIQUE_ID"},
                 "optional": {"image": (["#placeholder"], )},
                 }
 
@@ -1218,8 +1375,23 @@ class PreviewBridge(nodes.PreviewImage):
 
     CATEGORY = "ImpactPack/Util"
 
-    def doit(self, images, image, filename_prefix="ComfyUI", prompt=None, extra_pnginfo=None):
-        if image == "#placeholder" or image['image_hash'] != id(images) or ('0' in image and 'forward_filename' not in image[0]):
+    def doit(self, images, image, filename_prefix="ComfyUI", prompt=None, extra_pnginfo=None, unique_id=None):
+        global preview_hash_map
+        if image != "#placeholder" and isinstance(image, str):
+            image_path = folder_paths.get_annotated_filepath(image)
+            img = Image.open(image_path).convert("RGB")
+            data = np.array(img)
+            image_hash = get_image_hash(data)
+        else:
+            data = (255. * images[0].cpu().numpy()).astype(int)
+            image_hash = get_image_hash(data)
+
+        is_changed = False
+        if unique_id not in preview_hash_map or preview_hash_map[unique_id] != image_hash:
+            preview_hash_map[unique_id] = image_hash
+            is_changed = True
+
+        if is_changed or image == "#placeholder":
             # new input image
             res = self.save_images(images, filename_prefix, prompt, extra_pnginfo)
 
@@ -1232,7 +1404,7 @@ class PreviewBridge(nodes.PreviewImage):
 
             image, mask = nodes.LoadImage().load_image(filepath)
 
-            res['ui']['aux'] = [id(images), res['ui']['images']]
+            res['ui']['aux'] = [image_hash, res['ui']['images']]
             res['result'] = (image, mask, )
 
             return res
@@ -1257,7 +1429,7 @@ class PreviewBridge(nodes.PreviewImage):
             if 'type' in image and image['type'] != "":
                 imgpath += f" [{image['type']}]"
 
-            res['ui']['aux'] = [id(images), [forward]]
+            res['ui']['aux'] = [image_hash, [forward]]
             res['result'] = nodes.LoadImage().load_image(imgpath)
 
             return res
@@ -1382,3 +1554,167 @@ class LatentSwitch:
             return (latent3_opt,)
         else:
             return (latent4_opt,)
+
+
+class SEGSSwitch:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+                    "select": ("INT", {"default": 1, "min": 1, "max": 4, "step": 1}),
+                    "segs": ("SEGS",),
+                    },
+
+                "optional": {
+                        "segs2_opt": ("SEGS",),
+                        "segs3_opt": ("SEGS",),
+                        "segs4_opt": ("SEGS",),
+                    },
+                }
+
+    RETURN_TYPES = ("SEGS", )
+
+    OUTPUT_NODE = True
+
+    FUNCTION = "doit"
+
+    CATEGORY = "ImpactPack/Util"
+
+    def doit(self, select, segs, segs2_opt=None, segs3_opt=None, segs4_opt=None):
+        if select == 1:
+            return (segs,)
+        elif select == 2:
+            return (segs2_opt,)
+        elif select == 3:
+            return (segs3_opt,)
+        else:
+            return (segs4_opt,)
+
+
+class SaveConditioning:
+    def __init__(self):
+        self.output_dir = folder_paths.get_output_directory()
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {"conditioning": ("CONDITIONING", ),
+                             "filename_prefix": ("STRING", {"default": "conditioning/ComfyUI"}),
+                             },
+                "hidden": {"prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO"},
+                }
+
+    RETURN_TYPES = ()
+    FUNCTION = "doit"
+
+    OUTPUT_NODE = True
+
+    CATEGORY = "_for_testing"
+
+    def doit(self, conditioning, filename_prefix, prompt=None, extra_pnginfo=None):
+        # support save metadata for latent sharing
+        prompt_info = ""
+        if prompt is not None:
+            prompt_info = json.dumps(prompt)
+
+        for tensor_data, meta_data in conditioning:
+            full_output_folder, filename, counter, subfolder, filename_prefix = folder_paths.get_save_image_path(filename_prefix, self.output_dir)
+
+            metadata = {"prompt": prompt_info}
+            if extra_pnginfo is not None:
+                for x in extra_pnginfo:
+                    metadata[x] = json.dumps(extra_pnginfo[x])
+
+            file = f"{filename}_{counter:05}_.conditioning"
+            file = os.path.join(full_output_folder, file)
+
+            print(f"meta_data:{meta_data}")
+            print(f"tensor_data:{tensor_data}")
+
+            output = {"conditioning": tensor_data}
+            metadata['conditioning_aux'] = json.dumps(meta_data)
+
+            safetensors.torch.save_file(output, file, metadata=metadata)
+
+        return {}
+
+
+class LoadConditioning:
+    @classmethod
+    def INPUT_TYPES(s):
+        input_dir = folder_paths.get_input_directory()
+        files = [f for f in os.listdir(input_dir) if os.path.isfile(os.path.join(input_dir, f)) and f.endswith(".conditioning")]
+        return {"required": {"conditioning": [sorted(files), ]}, }
+
+    CATEGORY = "_for_testing"
+
+    RETURN_TYPES = ("CONDITIONING", )
+    FUNCTION = "load"
+
+    def load(self, conditioning):
+        conditioning_path = folder_paths.get_annotated_filepath(conditioning)
+        data = safetensors.torch.load_file(conditioning_path, device="cpu")
+        return ([[data['conditioning'], {}]], )
+
+    @classmethod
+    def IS_CHANGED(s, conditioning):
+        image_path = folder_paths.get_annotated_filepath(conditioning)
+        m = hashlib.sha256()
+        with open(image_path, 'rb') as f:
+            m.update(f.read())
+        return m.digest().hex()
+
+    @classmethod
+    def VALIDATE_INPUTS(s, conditioning):
+        if not folder_paths.exists_annotated_filepath(conditioning):
+            return "Invalid conditioning file: {}".format(conditioning)
+        return True
+
+
+class ImpactWildcardProcessor:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+                        "wildcard_text": ("STRING", {"multiline": True}),
+                        "populated_text": ("STRING", {"multiline": True}),
+                        "mode": (["Populate", "Fixed"], ),
+                    },
+                }
+
+    CATEGORY = "ImpactPack/Prompt"
+
+    RETURN_TYPES = ("STRING", )
+    FUNCTION = "doit"
+
+    def doit(self, wildcard_text, populated_text, mode):
+        return (populated_text, )
+
+
+class ImpactLogger:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+                        "text": ("STRING", {"default": ""}),
+                    },
+                "hidden": {"prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO"},
+                }
+
+    CATEGORY = "ImpactPack/Debug"
+
+    OUTPUT_NODE = True
+
+    RETURN_TYPES = ()
+    FUNCTION = "doit"
+
+    def doit(self, text, prompt, extra_pnginfo):
+        print(f"[IMPACT LOGGER]: {text}")
+
+        print(f"         PROMPT: {prompt}")
+
+        # for x in prompt:
+        #     if 'inputs' in x and 'populated_text' in x['inputs']:
+        #         print(f"PROMP: {x['10']['inputs']['populated_text']}")
+        #
+        # for x in extra_pnginfo['workflow']['nodes']:
+        #     if x['type'] == 'ImpactWildcardProcessor':
+        #         print(f" WV : {x['widgets_values'][1]}\n")
+
+        return {}

@@ -5,6 +5,7 @@ from PIL import Image, ImageFilter
 
 LANCZOS = (Image.Resampling.LANCZOS if hasattr(Image, 'Resampling') else Image.LANCZOS)
 
+
 def pil2tensor(image):
     return torch.from_numpy(np.array(image).astype(np.float32) / 255.0).unsqueeze(0)
 
@@ -191,3 +192,9 @@ def scale_tensor_and_to_pil(w,h, image):
     return image.resize((w, h), resample=LANCZOS)
 
 
+class NonListIterable:
+    def __init__(self, data):
+        self.data = data
+
+    def __getitem__(self, index):
+        return self.data[index]
