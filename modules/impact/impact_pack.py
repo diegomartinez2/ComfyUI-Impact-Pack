@@ -5,16 +5,24 @@ import comfy.samplers
 import comfy.sd
 import warnings
 from segment_anything import sam_model_registry
+from io import BytesIO
+import piexif
+import math
+import zipfile
+import re
+from server import PromptServer
 
 from impact.utils import *
 import impact.core as core
 from impact.core import SEG, NO_BBOX_DETECTOR, NO_SEGM_DETECTOR
-from impact.config import MAX_RESOLUTION
+from impact.config import MAX_RESOLUTION, latent_letter_path
 from PIL import Image
 import numpy as np
 import hashlib
 import json
 import safetensors.torch
+from PIL.PngImagePlugin import PngInfo
+import latent_preview
 
 warnings.filterwarnings('ignore', category=UserWarning, message='TypedStorage is deprecated')
 
@@ -243,16 +251,19 @@ class SEGSPreview:
         return {"required": {
                      "segs": ("SEGS", ),
                      },
+                "optional": {
+                     "fallback_image_opt": ("IMAGE", ),
+                    }
                 }
 
     RETURN_TYPES = ()
     FUNCTION = "doit"
 
-    CATEGORY = "ImpactPack/Detailer"
+    CATEGORY = "ImpactPack/Util"
 
     OUTPUT_NODE = True
 
-    def doit(self, segs):
+    def doit(self, segs, fallback_image_opt):
         full_output_folder, filename, counter, subfolder, filename_prefix = \
             folder_paths.get_save_image_path("impact_seg_preview", self.output_dir, segs[0][1], segs[0][0])
 
@@ -260,16 +271,62 @@ class SEGSPreview:
 
         for seg in segs[1]:
             if seg.cropped_image is not None:
+                cropped_image = seg.cropped_image
+            elif fallback_image_opt is not None:
+                # take from original image
+                cropped_image = crop_image(fallback_image_opt, seg.crop_region)
+                cropped_image = Image.fromarray(np.clip(255. * cropped_image.squeeze(), 0, 255).astype(np.uint8))
+
+            if cropped_image is not None:
                 file = f"{filename}_{counter:05}_.webp"
-                seg.cropped_image.save(os.path.join(full_output_folder, file))
+                cropped_image.save(os.path.join(full_output_folder, file))
                 results.append({
                     "filename": file,
                     "subfolder": subfolder,
                     "type": self.type
                 })
-            counter += 1
+
+                counter += 1
 
         return {"ui": {"images": results}}
+
+
+class SEGSToImageList:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+                     "segs": ("SEGS", ),
+                     },
+                "optional": {
+                     "fallback_image_opt": ("IMAGE", ),
+                    }
+                }
+
+    RETURN_TYPES = ("IMAGE",)
+    OUTPUT_IS_LIST = (True,)
+    FUNCTION = "doit"
+
+    CATEGORY = "ImpactPack/Util"
+
+    OUTPUT_NODE = True
+
+    def doit(self, segs, fallback_image_opt):
+        results = list()
+
+        for seg in segs[1]:
+            if seg.cropped_image is not None:
+                cropped_image = seg.cropped_image
+            elif fallback_image_opt is not None:
+                # take from original image
+                cropped_image = crop_image(fallback_image_opt, seg.crop_region)
+
+            cropped_image = torch.from_numpy(cropped_image)
+            results.append(cropped_image)
+
+        if len(results) == 0:
+            results.append(fallback_image_opt)
+
+        return (results,)
 
 
 class DetailerForEach:
@@ -414,6 +471,28 @@ class KSamplerProvider:
         return (sampler, )
 
 
+class KSamplerAdvancedProvider:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+                                "cfg": ("FLOAT", {"default": 8.0, "min": 0.0, "max": 100.0}),
+                                "sampler_name": (comfy.samplers.KSampler.SAMPLERS, ),
+                                "scheduler": (comfy.samplers.KSampler.SCHEDULERS, ),
+                                "basic_pipe": ("BASIC_PIPE", )
+                             },
+                }
+
+    RETURN_TYPES = ("KSAMPLER_ADVANCED",)
+    FUNCTION = "doit"
+
+    CATEGORY = "ImpactPack/Sampler"
+
+    def doit(self, cfg, sampler_name, scheduler, basic_pipe):
+        model, _, _, positive, negative = basic_pipe
+        sampler = core.KSamplerAdvancedWrapper(model, cfg, sampler_name, scheduler, positive, negative)
+        return (sampler, )
+
+
 class TwoSamplersForMask:
     @classmethod
     def INPUT_TYPES(s):
@@ -438,6 +517,70 @@ class TwoSamplersForMask:
 
         new_latent_image['noise_mask'] = mask
         new_latent_image = mask_sampler.sample(new_latent_image)
+
+        del new_latent_image['noise_mask']
+
+        return (new_latent_image, )
+
+
+class TwoAdvancedSamplersForMask:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+                     "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
+                     "steps": ("INT", {"default": 20, "min": 1, "max": 10000}),
+                     "denoise": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                     "samples": ("LATENT", ),
+                     "base_sampler": ("KSAMPLER_ADVANCED", ),
+                     "mask_sampler": ("KSAMPLER_ADVANCED", ),
+                     "mask": ("MASK", ),
+                     "overlap_factor": ("INT", {"default": 10, "min": 0, "max": 10000})
+                     },
+                }
+
+    RETURN_TYPES = ("LATENT", )
+    FUNCTION = "doit"
+
+    CATEGORY = "ImpactPack/Sampler"
+
+    @staticmethod
+    def mask_erosion(samples, mask, grow_mask_by):
+        mask = mask.clone()
+
+        w = samples['samples'].shape[3]
+        h = samples['samples'].shape[2]
+
+        mask2 = torch.nn.functional.interpolate(mask.reshape((-1, 1, mask.shape[-2], mask.shape[-1])), size=(w, h), mode="bilinear")
+        if grow_mask_by == 0:
+            mask_erosion = mask2
+        else:
+            kernel_tensor = torch.ones((1, 1, grow_mask_by, grow_mask_by))
+            padding = math.ceil((grow_mask_by - 1) / 2)
+
+            mask_erosion = torch.clamp(torch.nn.functional.conv2d(mask2.round(), kernel_tensor, padding=padding), 0, 1)
+
+        return mask_erosion[:, :, :w, :h].round()
+
+    def doit(self, seed, steps, denoise, samples, base_sampler, mask_sampler, mask, overlap_factor):
+
+        inv_mask = torch.where(mask != 1.0, torch.tensor(1.0), torch.tensor(0.0))
+
+        adv_steps = int(steps / denoise)
+        start_at_step = adv_steps - steps
+
+        new_latent_image = samples.copy()
+
+        mask_erosion = TwoAdvancedSamplersForMask.mask_erosion(samples, mask, overlap_factor)
+
+        for i in range(start_at_step, adv_steps):
+            add_noise = "enable" if i == start_at_step else "disable"
+            return_with_leftover_noise = "enable" if i+1 != adv_steps else "disable"
+
+            new_latent_image['noise_mask'] = inv_mask
+            new_latent_image = base_sampler.sample_advanced(add_noise, seed, adv_steps, new_latent_image, i, i + 1, "enable")
+
+            new_latent_image['noise_mask'] = mask_erosion
+            new_latent_image = mask_sampler.sample_advanced("disable", seed, adv_steps, new_latent_image, i, i + 1, return_with_leftover_noise)
 
         del new_latent_image['noise_mask']
 
@@ -1454,7 +1597,7 @@ class ImageReceiver(nodes.LoadImage):
 
     @classmethod
     def VALIDATE_INPUTS(s, image, link_id):
-        if not folder_paths.exists_annotated_filepath(image):
+        if not folder_paths.exists_annotated_filepath(image) or image.startswith("/") or ".." in image:
             return "Invalid image file: {}".format(image)
 
         return True
@@ -1482,6 +1625,203 @@ class ImageSender(nodes.PreviewImage):
         result = nodes.PreviewImage().save_images(images, filename_prefix, prompt, extra_pnginfo)
         PromptServer.instance.send_sync("img-send", {"link_id": link_id, "images": result['ui']['images']})
         return result
+
+
+class LatentReceiver:
+    def __init__(self):
+        self.input_dir = folder_paths.get_input_directory()
+        self.type = "input"
+
+    @classmethod
+    def INPUT_TYPES(s):
+        def check_file_extension(x):
+            return x.endswith(".latent") or x.endswith(".latent.png")
+
+        input_dir = folder_paths.get_input_directory()
+        files = [f for f in os.listdir(input_dir) if os.path.isfile(os.path.join(input_dir, f)) and check_file_extension(f)]
+        return {"required": {
+                    "latent": (sorted(files), ),
+                    "link_id": ("INT", {"default": 0, "min": 0, "max": sys.maxsize, "step": 1}),
+                    },
+                }
+
+    FUNCTION = "doit"
+
+    CATEGORY = "ImpactPack/Util"
+
+    RETURN_TYPES = ("LATENT",)
+
+    @staticmethod
+    def load_preview_latent(image_path):
+        image = Image.open(image_path)
+        exif_data = piexif.load(image.info["exif"])
+
+        if piexif.ExifIFD.UserComment in exif_data["Exif"]:
+            compressed_data = exif_data["Exif"][piexif.ExifIFD.UserComment]
+            compressed_data_io = BytesIO(compressed_data)
+            with zipfile.ZipFile(compressed_data_io, mode='r') as archive:
+                tensor_bytes = archive.read("latent")
+            tensor = safetensors.torch.load(tensor_bytes)
+            return {"samples": tensor['latent_tensor']}
+        return None
+
+    def parse_filename(self, filename):
+        pattern = r"^(.*)/(.*?)\[(.*)\]\s*$"
+        match = re.match(pattern, filename)
+        if match:
+            subfolder = match.group(1)
+            filename = match.group(2).rstrip()
+            file_type = match.group(3)
+        else:
+            subfolder = ''
+            file_type = self.type
+
+        return {'filename': filename, 'subfolder': subfolder, 'type': file_type}
+
+    def doit(self, latent, link_id):
+        latent_name = latent
+        latent_path = folder_paths.get_annotated_filepath(latent_name)
+
+        if latent.endswith(".latent"):
+            latent = safetensors.torch.load_file(latent_path, device="cpu")
+            multiplier = 1.0
+            if "latent_format_version_0" not in latent:
+                multiplier = 1.0 / 0.18215
+            samples = {"samples": latent["latent_tensor"].float() * multiplier}
+        else:
+            samples = LatentReceiver.load_preview_latent(latent_path)
+
+        preview = self.parse_filename(latent_name)
+
+        return {
+                'ui': {"images": [preview]},
+                'result': (samples, )
+                }
+
+    @classmethod
+    def IS_CHANGED(s, latent, link_id):
+        image_path = folder_paths.get_annotated_filepath(latent)
+        m = hashlib.sha256()
+        with open(image_path, 'rb') as f:
+            m.update(f.read())
+        return m.digest().hex()
+
+    @classmethod
+    def VALIDATE_INPUTS(s, latent, link_id):
+        if not folder_paths.exists_annotated_filepath(latent) or latent.startswith("/") or ".." in latent.contains:
+            return "Invalid latent file: {}".format(latent)
+        return True
+
+
+class LatentSender(nodes.SaveLatent):
+    def __init__(self):
+        self.output_dir = folder_paths.get_temp_directory()
+        self.type = "temp"
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+                    "samples": ("LATENT", ),
+                    "filename_prefix": ("STRING", {"default": "latents/LatentSender"}),
+                    "link_id": ("INT", {"default": 0, "min": 0, "max": sys.maxsize, "step": 1}), },
+                "hidden": {"prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO"},
+                }
+
+    OUTPUT_NODE = True
+
+    RETURN_TYPES = ()
+
+    FUNCTION = "doit"
+
+    CATEGORY = "ImpactPack/Util"
+
+    @staticmethod
+    def save_to_file(tensor_bytes, prompt, extra_pnginfo, image, image_path):
+        compressed_data = BytesIO()
+        with zipfile.ZipFile(compressed_data, mode='w') as archive:
+            archive.writestr("latent", tensor_bytes)
+        image = image.copy()
+        exif_data = {"Exif": {piexif.ExifIFD.UserComment: compressed_data.getvalue()}}
+
+        metadata = PngInfo()
+        if prompt is not None:
+            metadata.add_text("prompt", json.dumps(prompt))
+        if extra_pnginfo is not None:
+            for x in extra_pnginfo:
+                metadata.add_text(x, json.dumps(extra_pnginfo[x]))
+
+        exif_bytes = piexif.dump(exif_data)
+        image.save(image_path, format='png', exif=exif_bytes, pnginfo=metadata, optimize=True)
+
+    @staticmethod
+    def prepare_preview(latent_tensor):
+        lower_bound = 128
+        upper_bound = 256
+
+        previewer = core.get_previewer("cpu", force=True)
+        image = previewer.decode_latent_to_preview(latent_tensor)
+        min_size = min(image.size[0], image.size[1])
+        max_size = max(image.size[0], image.size[1])
+
+        scale_factor = 1
+        if max_size > upper_bound:
+            scale_factor = upper_bound/max_size
+
+        # prevent too small preview
+        if min_size*scale_factor < lower_bound:
+            scale_factor = lower_bound/min_size
+
+        w = int(image.size[0] * scale_factor)
+        h = int(image.size[1] * scale_factor)
+
+        image = image.resize((w, h), resample=Image.NEAREST)
+
+        return LatentSender.attach_format_text(image)
+
+    @staticmethod
+    def attach_format_text(image):
+        width_a, height_a = image.size
+
+        letter_image = Image.open(latent_letter_path)
+        width_b, height_b = letter_image.size
+
+        new_width = max(width_a, width_b)
+        new_height = height_a + height_b
+
+        new_image = Image.new('RGB', (new_width, new_height), (0, 0, 0))
+
+        offset_x = (new_width - width_b) // 2
+        offset_y = (height_a + (new_height - height_a - height_b) // 2)
+        new_image.paste(letter_image, (offset_x, offset_y))
+
+        new_image.paste(image, (0, 0))
+
+        return new_image
+
+    def doit(self, samples, filename_prefix="latents/LatentSender", link_id=0, prompt=None, extra_pnginfo=None):
+        full_output_folder, filename, counter, subfolder, filename_prefix = folder_paths.get_save_image_path(filename_prefix, self.output_dir)
+
+        # load preview
+        preview = LatentSender.prepare_preview(samples['samples'])
+
+        # support save metadata for latent sharing
+        file = f"{filename}_{counter:05}_.latent.png"
+        fullpath = os.path.join(full_output_folder, file)
+
+        output = {"latent_tensor": samples["samples"]}
+
+        tensor_bytes = safetensors.torch.save(output)
+        LatentSender.save_to_file(tensor_bytes, prompt, extra_pnginfo, preview, fullpath)
+
+        latent_path = {
+                    'filename': file,
+                    'subfolder': subfolder,
+                    'type': self.type
+                    }
+
+        PromptServer.instance.send_sync("latent-send", {"link_id": link_id, "images": [latent_path]})
+
+        return {'ui': {'images': [latent_path]}}
 
 
 class ImageMaskSwitch:
@@ -1527,13 +1867,13 @@ class LatentSwitch:
     def INPUT_TYPES(s):
         return {"required": {
                     "select": ("INT", {"default": 1, "min": 1, "max": 4, "step": 1}),
-                    "latent1": ("IMAGE",),
+                    "latent1": ("LATENT",),
                     },
 
                 "optional": {
-                        "latent2_opt": ("IMAGE",),
-                        "latent3_opt": ("IMAGE",),
-                        "latent4_opt": ("IMAGE",),
+                        "latent2_opt": ("LATENT",),
+                        "latent3_opt": ("LATENT",),
+                        "latent4_opt": ("LATENT",),
                     },
                 }
 

@@ -674,6 +674,26 @@ class KSamplerWrapper:
         return nodes.common_ksampler(model, seed, steps, cfg, sampler_name, scheduler, positive, negative, latent_image, denoise=denoise)[0]
 
 
+class KSamplerAdvancedWrapper:
+    params = None
+
+    def __init__(self, model, cfg, sampler_name, scheduler, positive, negative):
+        self.params = model, cfg, sampler_name, scheduler, positive, negative
+
+    def sample_advanced(self, add_noise, seed, steps, latent_image, start_at_step, end_at_step, return_with_leftover_noise, hook=None):
+        model, cfg, sampler_name, scheduler, positive, negative = self.params
+
+        if hook is not None:
+            model, seed, steps, cfg, sampler_name, scheduler, positive, negative, upscaled_latent = \
+                hook.pre_ksample_advanced(model, add_noise, seed, steps, cfg, sampler_name, scheduler,
+                                          positive, negative, latent_image, start_at_step, end_at_step,
+                                          return_with_leftover_noise)
+
+        return nodes.KSamplerAdvanced().sample(model, add_noise, seed, steps, cfg, sampler_name, scheduler,
+                                               positive, negative, latent_image, start_at_step, end_at_step,
+                                               return_with_leftover_noise)[0]
+
+
 class PixelKSampleHook:
     cur_step = 0
     total_step = 0
@@ -1158,3 +1178,40 @@ def update_node_status(node, text, progress=None):
         "progress": progress,
         "text": text
     }, PromptServer.instance.client_id)
+
+
+from comfy.cli_args import args, LatentPreviewMethod
+import folder_paths
+from latent_preview import TAESD, TAESDPreviewerImpl, Latent2RGBPreviewer
+
+try:
+    import comfy.latent_formats as latent_formats
+
+    def get_previewer(device, latent_format=latent_formats.SD15(), force=False):
+        previewer = None
+        method = args.preview_method
+        if method != LatentPreviewMethod.NoPreviews or force:
+            # TODO previewer methods
+            taesd_decoder_path = folder_paths.get_full_path("vae_approx", latent_format.taesd_decoder_name)
+
+            if method == LatentPreviewMethod.Auto:
+                method = LatentPreviewMethod.Latent2RGB
+                if taesd_decoder_path:
+                    method = LatentPreviewMethod.TAESD
+
+            if method == LatentPreviewMethod.TAESD:
+                if taesd_decoder_path:
+                    taesd = TAESD(None, taesd_decoder_path).to(device)
+                    previewer = TAESDPreviewerImpl(taesd)
+                else:
+                    print("Warning: TAESD previews enabled, but could not find models/vae_approx/{}".format(latent_format.taesd_decoder_name))
+
+            if previewer is None:
+                previewer = Latent2RGBPreviewer(latent_format.latent_rgb_factors)
+        return previewer
+
+except:
+    print(f"#########################################################################")
+    print(f"[ERROR] ComfyUI-Impact-Pack: Please update ComfyUI to the latest version.")
+    print(f"#########################################################################")
+

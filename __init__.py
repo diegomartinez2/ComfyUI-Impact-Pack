@@ -39,6 +39,7 @@ try:
     from mmdet.evaluation import get_classes
     from skimage.measure import label, regionprops
     from collections import namedtuple
+    import piexif
 except:
     import importlib
     print("### ComfyUI-Impact-Pack: Reinstall dependencies (several dependencies are missing.)")
@@ -134,9 +135,14 @@ NODE_CLASS_MAPPINGS = {
     "TwoSamplersForMask": TwoSamplersForMask,
     "TiledKSamplerProvider": TiledKSamplerProvider,
 
+    "KSamplerAdvancedProvider": KSamplerAdvancedProvider,
+    "TwoAdvancedSamplersForMask": TwoAdvancedSamplersForMask,
+
     "PreviewBridge": PreviewBridge,
     "ImageSender": ImageSender,
     "ImageReceiver": ImageReceiver,
+    "LatentSender": LatentSender,
+    "LatentReceiver": LatentReceiver,
     "ImageMaskSwitch": ImageMaskSwitch,
     "LatentSwitch": LatentSwitch,
     "SEGSSwitch": SEGSSwitch,
@@ -150,6 +156,7 @@ NODE_CLASS_MAPPINGS = {
     "SEGSDetailer": SEGSDetailer,
     "SEGSPaste": SEGSPaste,
     "SEGSPreview": SEGSPreview,
+    "SEGSToImageList": SEGSToImageList,
 
     "MaskPainter": impact.legacy_nodes.MaskPainter,
     "MMDetLoader": impact.legacy_nodes.MMDetLoader,
