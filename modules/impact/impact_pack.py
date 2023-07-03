@@ -10,6 +10,7 @@ import piexif
 import math
 import zipfile
 import re
+from PIL import ImageDraw
 from server import PromptServer
 
 from impact.utils import *
@@ -23,6 +24,7 @@ import json
 import safetensors.torch
 from PIL.PngImagePlugin import PngInfo
 import latent_preview
+import comfy.model_management
 
 warnings.filterwarnings('ignore', category=UserWarning, message='TypedStorage is deprecated')
 
@@ -102,15 +104,20 @@ class CLIPSegDetectorProvider:
 
 class SAMLoader:
     @classmethod
-    def INPUT_TYPES(s):
-        return {"required": {"model_name": (folder_paths.get_filename_list("sams"), )}}
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model_name": (folder_paths.get_filename_list("sams"), ),
+                "device_mode": (["AUTO", "Prefer GPU", "CPU"],),
+            }
+        }
 
     RETURN_TYPES = ("SAM_MODEL", )
     FUNCTION = "load_model"
 
     CATEGORY = "ImpactPack"
 
-    def load_model(self, model_name):
+    def load_model(self, model_name, device_mode="auto"):
         modelname = folder_paths.get_full_path("sams", model_name)
 
         if 'vit_h' in model_name:
@@ -121,7 +128,15 @@ class SAMLoader:
             model_kind = 'vit_b'
 
         sam = sam_model_registry[model_kind](checkpoint=modelname)
-        print(f"Loads SAM model: {modelname}")
+        # Unless user explicitly wants to use CPU, we use GPU
+        device = comfy.model_management.get_torch_device() if device_mode == "Prefer GPU" else "CPU"
+
+        if device_mode == "Prefer GPU":
+            sam.to(device=device)
+
+        sam.is_auto_mode = device_mode == "AUTO"
+
+        print(f"Loads SAM model: {modelname} (device:{device_mode})")
         return (sam, )
 
 
@@ -158,6 +173,7 @@ class SEGSDetailer:
                      "segs": ("SEGS", ),
                      "guide_size": ("FLOAT", {"default": 256, "min": 64, "max": nodes.MAX_RESOLUTION, "step": 8}),
                      "guide_size_for": (["bbox", "crop_region"],),
+                     "max_size": ("FLOAT", {"default": 768, "min": 64, "max": nodes.MAX_RESOLUTION, "step": 8}),
                      "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
                      "steps": ("INT", {"default": 20, "min": 1, "max": 10000}),
                      "cfg": ("FLOAT", {"default": 8.0, "min": 0.0, "max": 100.0}),
@@ -176,12 +192,10 @@ class SEGSDetailer:
     CATEGORY = "ImpactPack/Detailer"
 
     @staticmethod
-    def do_detail(image, segs, guide_size, guide_size_for, seed, steps, cfg, sampler_name, scheduler,
+    def do_detail(image, segs, guide_size, guide_size_for, max_size, seed, steps, cfg, sampler_name, scheduler,
                   denoise, noise_mask, force_inpaint, basic_pipe):
 
-        model, _, vae, positive, negative = basic_pipe
-
-        image_pil = tensor2pil(image).convert('RGBA')
+        model, clip, vae, positive, negative = basic_pipe
 
         new_segs = []
 
@@ -194,19 +208,19 @@ class SEGSDetailer:
             else:
                 cropped_mask = None
 
-            enhanced_pil = core.enhance_detail(cropped_image, model, vae, guide_size, guide_size_for, seg.bbox,
-                                               seed, steps, cfg, sampler_name, scheduler,
+            enhanced_pil = core.enhance_detail(cropped_image, model, clip, vae, guide_size, guide_size_for, max_size,
+                                               seg.bbox, seed, steps, cfg, sampler_name, scheduler,
                                                positive, negative, denoise, cropped_mask, force_inpaint == "enabled")
 
-            new_seg = seg._replace(cropped_image=enhanced_pil)
+            new_seg = SEG(enhanced_pil, seg.cropped_mask, seg.confidence, seg.crop_region, seg.bbox, seg.label)
             new_segs.append(new_seg)
 
         return segs[0], new_segs
 
-    def doit(self, image, segs, guide_size, guide_size_for, seed, steps, cfg, sampler_name, scheduler,
+    def doit(self, image, segs, guide_size, guide_size_for, max_size, seed, steps, cfg, sampler_name, scheduler,
              denoise, noise_mask, force_inpaint, basic_pipe):
 
-        segs = SEGSDetailer.do_detail(image, segs, guide_size, guide_size_for, seed, steps, cfg, sampler_name, scheduler,
+        segs = SEGSDetailer.do_detail(image, segs, guide_size, guide_size_for, max_size, seed, steps, cfg, sampler_name, scheduler,
                                       denoise, noise_mask, force_inpaint, basic_pipe)
 
         return (segs, )
@@ -310,21 +324,25 @@ class SEGSToImageList:
 
     OUTPUT_NODE = True
 
-    def doit(self, segs, fallback_image_opt):
+    def doit(self, segs, fallback_image_opt=None):
         results = list()
 
         for seg in segs[1]:
             if seg.cropped_image is not None:
-                cropped_image = seg.cropped_image
+                cropped_image = pil2tensor(seg.cropped_image)
             elif fallback_image_opt is not None:
                 # take from original image
-                cropped_image = crop_image(fallback_image_opt, seg.crop_region)
+                cropped_image = torch.from_numpy(crop_image(fallback_image_opt, seg.crop_region))
+            else:
+                image = Image.new("RGB", (64, 64))
+                draw = ImageDraw.Draw(image)
+                draw.rectangle((0, 0, 63, 63), fill=(0, 0, 0))
+                cropped_image = pil2tensor(image)
 
-            cropped_image = torch.from_numpy(cropped_image)
             results.append(cropped_image)
 
         if len(results) == 0:
-            results.append(fallback_image_opt)
+            results.append(pil2tensor(Image.new("RGBA", (8, 8))))
 
         return (results,)
 
@@ -336,9 +354,11 @@ class DetailerForEach:
                      "image": ("IMAGE", ),
                      "segs": ("SEGS", ),
                      "model": ("MODEL",),
+                     "clip": ("CLIP",),
                      "vae": ("VAE",),
                      "guide_size": ("FLOAT", {"default": 256, "min": 64, "max": nodes.MAX_RESOLUTION, "step": 8}),
                      "guide_size_for": (["bbox", "crop_region"],),
+                     "max_size": ("FLOAT", {"default": 768, "min": 64, "max": nodes.MAX_RESOLUTION, "step": 8}),
                      "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
                      "steps": ("INT", {"default": 20, "min": 1, "max": 10000}),
                      "cfg": ("FLOAT", {"default": 8.0, "min": 0.0, "max": 100.0}),
@@ -359,8 +379,8 @@ class DetailerForEach:
     CATEGORY = "ImpactPack/Detailer"
 
     @staticmethod
-    def do_detail(image, segs, model, vae, guide_size, guide_size_for, seed, steps, cfg, sampler_name, scheduler,
-                  positive, negative, denoise, feather, noise_mask, force_inpaint):
+    def do_detail(image, segs, model, clip, vae, guide_size, guide_size_for, max_size, seed, steps, cfg, sampler_name, scheduler,
+                  positive, negative, denoise, feather, noise_mask, force_inpaint, wildcard_opt=None):
 
         image_pil = tensor2pil(image).convert('RGBA')
 
@@ -378,31 +398,31 @@ class DetailerForEach:
             else:
                 cropped_mask = None
 
-            enhanced_pil = core.enhance_detail(cropped_image, model, vae, guide_size, guide_size_for, seg.bbox,
-                                          seed, steps, cfg, sampler_name, scheduler,
-                                          positive, negative, denoise, cropped_mask, force_inpaint == "enabled")
+            enhanced_pil = core.enhance_detail(cropped_image, model, clip, vae, guide_size, guide_size_for, max_size,
+                                               seg.bbox, seed, steps, cfg, sampler_name, scheduler,
+                                               positive, negative, denoise, cropped_mask, force_inpaint == "enabled", wildcard_opt)
 
             if not (enhanced_pil is None):
                 # don't latent composite-> converting to latent caused poor quality
                 # use image paste
                 image_pil.paste(enhanced_pil, (seg.crop_region[0], seg.crop_region[1]), mask_pil)
-                enhanced_list.append(np.squeeze(pil2tensor(enhanced_pil)))
+                enhanced_list.append(pil2tensor(enhanced_pil))
 
-            cropped_list.append(np.squeeze(torch.from_numpy(cropped_image)))
+            cropped_list.append(torch.from_numpy(cropped_image))
 
         image_tensor = pil2tensor(image_pil.convert('RGB'))
 
         cropped_list.sort(key=lambda x: x.shape, reverse=True)
         enhanced_list.sort(key=lambda x: x.shape, reverse=True)
 
-        return image_tensor, NonListIterable(cropped_list), NonListIterable(enhanced_list)
+        return image_tensor, cropped_list, enhanced_list
 
-    def doit(self, image, segs, model, vae, guide_size, guide_size_for, seed, steps, cfg, sampler_name, scheduler,
-             positive, negative, denoise, feather, noise_mask, force_inpaint):
+    def doit(self, image, segs, model, clip, vae, guide_size, guide_size_for, max_size, seed, steps, cfg, sampler_name,
+             scheduler, positive, negative, denoise, feather, noise_mask, force_inpaint):
 
         enhanced_img, cropped, cropped_enhanced = \
-            DetailerForEach.do_detail(image, segs, model, vae, guide_size, guide_size_for, seed, steps, cfg,
-                                      sampler_name, scheduler, positive, negative, denoise, feather, noise_mask,
+            DetailerForEach.do_detail(image, segs, model, clip, vae, guide_size, guide_size_for, max_size, seed, steps,
+                                      cfg, sampler_name, scheduler, positive, negative, denoise, feather, noise_mask,
                                       force_inpaint)
 
         return (enhanced_img, )
@@ -416,6 +436,7 @@ class DetailerForEachPipe:
                      "segs": ("SEGS", ),
                      "guide_size": ("FLOAT", {"default": 256, "min": 64, "max": nodes.MAX_RESOLUTION, "step": 8}),
                      "guide_size_for": (["bbox", "crop_region"],),
+                     "max_size": ("FLOAT", {"default": 768, "min": 64, "max": nodes.MAX_RESOLUTION, "step": 8}),
                      "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
                      "steps": ("INT", {"default": 20, "min": 1, "max": 10000}),
                      "cfg": ("FLOAT", {"default": 8.0, "min": 0.0, "max": 100.0}),
@@ -434,12 +455,12 @@ class DetailerForEachPipe:
 
     CATEGORY = "ImpactPack/Detailer"
 
-    def doit(self, image, segs, guide_size, guide_size_for, seed, steps, cfg, sampler_name, scheduler,
+    def doit(self, image, segs, guide_size, guide_size_for, max_size, seed, steps, cfg, sampler_name, scheduler,
              denoise, feather, noise_mask, force_inpaint, basic_pipe):
 
-        model, _, vae, positive, negative = basic_pipe
+        model, clip, vae, positive, negative = basic_pipe
         enhanced_img, cropped, cropped_enhanced = \
-            DetailerForEach.do_detail(image, segs, model, vae, guide_size, guide_size_for, seed, steps, cfg,
+            DetailerForEach.do_detail(image, segs, model, clip, vae, guide_size, guide_size_for, max_size, seed, steps, cfg,
                                       sampler_name, scheduler, positive, negative, denoise, feather, noise_mask,
                                       force_inpaint)
 
@@ -593,9 +614,11 @@ class FaceDetailer:
         return {"required": {
                      "image": ("IMAGE", ),
                      "model": ("MODEL",),
+                     "clip": ("CLIP",),
                      "vae": ("VAE",),
                      "guide_size": ("FLOAT", {"default": 256, "min": 64, "max": nodes.MAX_RESOLUTION, "step": 8}),
                      "guide_size_for": (["bbox", "crop_region"],),
+                     "max_size": ("FLOAT", {"default": 768, "min": 64, "max": nodes.MAX_RESOLUTION, "step": 8}),
                      "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
                      "steps": ("INT", {"default": 20, "min": 1, "max": 10000}),
                      "cfg": ("FLOAT", {"default": 8.0, "min": 0.0, "max": 100.0}),
@@ -622,6 +645,7 @@ class FaceDetailer:
                      "drop_size": ("INT", {"min": 1, "max": MAX_RESOLUTION, "step": 1, "default": 10}),
 
                      "bbox_detector": ("BBOX_DETECTOR", ),
+                     "wildcard": ("STRING", {"multiline": True}),
                      },
                 "optional": {
                     "sam_model_opt": ("SAM_MODEL", ),
@@ -629,17 +653,18 @@ class FaceDetailer:
 
     RETURN_TYPES = ("IMAGE", "IMAGE", "MASK", "DETAILER_PIPE", )
     RETURN_NAMES = ("image", "cropped_refined", "mask", "detailer_pipe")
+    OUTPUT_IS_LIST = (False, True, False, False)
     FUNCTION = "doit"
 
     CATEGORY = "ImpactPack/Simple"
 
     @staticmethod
-    def enhance_face(image, model, vae, guide_size, guide_size_for, seed, steps, cfg, sampler_name, scheduler,
+    def enhance_face(image, model, clip, vae, guide_size, guide_size_for, max_size, seed, steps, cfg, sampler_name, scheduler,
                      positive, negative, denoise, feather, noise_mask, force_inpaint,
                      bbox_threshold, bbox_dilation, bbox_crop_factor,
                      sam_detection_hint, sam_dilation, sam_threshold, sam_bbox_expansion, sam_mask_hint_threshold,
                      sam_mask_hint_use_negative, drop_size,
-                     bbox_detector, sam_model_opt=None):
+                     bbox_detector, wildcard_opt=None, sam_model_opt=None):
         # make default prompt as 'face' if empty prompt for CLIPSeg
         bbox_detector.setAux('face')
         segs = bbox_detector.detect(image, bbox_threshold, bbox_dilation, bbox_crop_factor, drop_size)
@@ -653,29 +678,29 @@ class FaceDetailer:
             segs = core.segs_bitwise_and_mask(segs, sam_mask)
 
         enhanced_img, _, cropped_enhanced = \
-            DetailerForEach.do_detail(image, segs, model, vae, guide_size, guide_size_for, seed, steps, cfg,
+            DetailerForEach.do_detail(image, segs, model, clip, vae, guide_size, guide_size_for, max_size, seed, steps, cfg,
                                       sampler_name, scheduler, positive, negative, denoise, feather, noise_mask,
-                                      force_inpaint)
+                                      force_inpaint, wildcard_opt)
 
         # Mask Generator
         mask = core.segs_to_combined_mask(segs)
 
         return enhanced_img, cropped_enhanced, mask
 
-    def doit(self, image, model, vae, guide_size, guide_size_for, seed, steps, cfg, sampler_name, scheduler,
+    def doit(self, image, model, clip, vae, guide_size, guide_size_for, max_size, seed, steps, cfg, sampler_name, scheduler,
              positive, negative, denoise, feather, noise_mask, force_inpaint,
              bbox_threshold, bbox_dilation, bbox_crop_factor,
              sam_detection_hint, sam_dilation, sam_threshold, sam_bbox_expansion, sam_mask_hint_threshold,
-             sam_mask_hint_use_negative, drop_size, bbox_detector, sam_model_opt=None):
+             sam_mask_hint_use_negative, drop_size, bbox_detector, wildcard, sam_model_opt=None):
 
         enhanced_img, cropped_enhanced, mask = FaceDetailer.enhance_face(
-            image, model, vae, guide_size, guide_size_for, seed, steps, cfg, sampler_name, scheduler,
+            image, model, clip, vae, guide_size, guide_size_for, max_size, seed, steps, cfg, sampler_name, scheduler,
             positive, negative, denoise, feather, noise_mask, force_inpaint,
             bbox_threshold, bbox_dilation, bbox_crop_factor,
             sam_detection_hint, sam_dilation, sam_threshold, sam_bbox_expansion, sam_mask_hint_threshold,
-            sam_mask_hint_use_negative, drop_size, bbox_detector, sam_model_opt)
+            sam_mask_hint_use_negative, drop_size, bbox_detector, wildcard, sam_model_opt)
 
-        pipe = (model, vae, positive, negative, bbox_detector, sam_model_opt)
+        pipe = (model, clip, vae, positive, negative, bbox_detector, wildcard, sam_model_opt)
         return enhanced_img, cropped_enhanced, mask, pipe
 
 
@@ -1148,6 +1173,7 @@ class FaceDetailerPipe:
                      "detailer_pipe": ("DETAILER_PIPE",),
                      "guide_size": ("FLOAT", {"default": 256, "min": 64, "max": nodes.MAX_RESOLUTION, "step": 8}),
                      "guide_size_for": (["bbox", "crop_region"],),
+                     "max_size": ("FLOAT", {"default": 768, "min": 64, "max": nodes.MAX_RESOLUTION, "step": 8}),
                      "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
                      "steps": ("INT", {"default": 20, "min": 1, "max": 10000}),
                      "cfg": ("FLOAT", {"default": 8.0, "min": 0.0, "max": 100.0}),
@@ -1175,23 +1201,24 @@ class FaceDetailerPipe:
 
     RETURN_TYPES = ("IMAGE", "IMAGE", "MASK", "DETAILER_PIPE", )
     RETURN_NAMES = ("image", "cropped_refined", "mask", "detailer_pipe")
+    OUTPUT_IS_LIST = (False, True, False, False)
     FUNCTION = "doit"
 
     CATEGORY = "ImpactPack/Simple"
 
-    def doit(self, image, detailer_pipe, guide_size, guide_size_for, seed, steps, cfg, sampler_name, scheduler,
+    def doit(self, image, detailer_pipe, guide_size, guide_size_for, max_size, seed, steps, cfg, sampler_name, scheduler,
              denoise, feather, noise_mask, force_inpaint, bbox_threshold, bbox_dilation, bbox_crop_factor,
              sam_detection_hint, sam_dilation, sam_threshold, sam_bbox_expansion,
              sam_mask_hint_threshold, sam_mask_hint_use_negative, drop_size):
 
-        model, vae, positive, negative, bbox_detector, sam_model_opt = detailer_pipe
+        model, clip, vae, positive, negative, bbox_detector, wildcard, sam_model_opt = detailer_pipe
 
         enhanced_img, cropped_enhanced, mask = FaceDetailer.enhance_face(
-            image, model, vae, guide_size, guide_size_for, seed, steps, cfg, sampler_name, scheduler,
+            image, model, clip, vae, guide_size, guide_size_for, max_size, seed, steps, cfg, sampler_name, scheduler,
             positive, negative, denoise, feather, noise_mask, force_inpaint,
             bbox_threshold, bbox_dilation, bbox_crop_factor,
             sam_detection_hint, sam_dilation, sam_threshold, sam_bbox_expansion, sam_mask_hint_threshold,
-            sam_mask_hint_use_negative, drop_size, bbox_detector, sam_model_opt)
+            sam_mask_hint_use_negative, drop_size, bbox_detector, wildcard, sam_model_opt)
 
         return enhanced_img, cropped_enhanced, mask, detailer_pipe
 
@@ -1199,24 +1226,26 @@ class FaceDetailerPipe:
 class DetailerForEachTest(DetailerForEach):
     RETURN_TYPES = ("IMAGE", "IMAGE", "IMAGE", )
     RETURN_NAMES = ("image", "cropped", "cropped_refined")
+    OUTPUT_IS_LIST = (False, True, True)
+
     FUNCTION = "doit"
 
     CATEGORY = "ImpactPack/Detailer"
 
-    def doit(self, image, segs, model, vae, guide_size, guide_size_for, seed, steps, cfg, sampler_name, scheduler,
-             positive, negative, denoise, feather, noise_mask, force_inpaint):
+    def doit(self, image, segs, model, clip, vae, guide_size, guide_size_for, max_size, seed, steps, cfg, sampler_name,
+             scheduler, positive, negative, denoise, feather, noise_mask, force_inpaint):
 
         enhanced_img, cropped, cropped_enhanced = \
-            DetailerForEach.do_detail(image, segs, model, vae, guide_size, guide_size_for, seed, steps, cfg,
-                                      sampler_name, scheduler, positive, negative, denoise, feather, noise_mask,
+            DetailerForEach.do_detail(image, segs, model, clip, vae, guide_size, guide_size_for, max_size, seed, steps,
+                                      cfg, sampler_name, scheduler, positive, negative, denoise, feather, noise_mask,
                                       force_inpaint)
 
         # set fallback image
-        if cropped is None:
-            cropped = enhanced_img
+        if len(cropped) == 0:
+            cropped = [enhanced_img]
 
-        if cropped_enhanced is None:
-            cropped_enhanced = enhanced_img
+        if len(cropped_enhanced) == 0:
+            cropped_enhanced = [enhanced_img]
 
         return enhanced_img, cropped, cropped_enhanced,
 
@@ -1224,25 +1253,27 @@ class DetailerForEachTest(DetailerForEach):
 class DetailerForEachTestPipe(DetailerForEachPipe):
     RETURN_TYPES = ("IMAGE", "IMAGE", "IMAGE", )
     RETURN_NAMES = ("image", "cropped", "cropped_refined")
+    OUTPUT_IS_LIST = (False, True, True)
+
     FUNCTION = "doit"
 
     CATEGORY = "ImpactPack/Detailer"
 
-    def doit(self, image, segs, guide_size, guide_size_for, seed, steps, cfg, sampler_name, scheduler,
+    def doit(self, image, segs, guide_size, guide_size_for, max_size, seed, steps, cfg, sampler_name, scheduler,
              denoise, feather, noise_mask, force_inpaint, basic_pipe):
 
-        model, _, vae, positive, negative = basic_pipe
+        model, clip, vae, positive, negative = basic_pipe
         enhanced_img, cropped, cropped_enhanced = \
-            DetailerForEach.do_detail(image, segs, model, vae, guide_size, guide_size_for, seed, steps, cfg,
+            DetailerForEach.do_detail(image, segs, model, clip, vae, guide_size, guide_size_for, max_size, seed, steps, cfg,
                                       sampler_name, scheduler, positive, negative, denoise, feather, noise_mask,
                                       force_inpaint)
 
         # set fallback image
-        if cropped is None:
-            cropped = enhanced_img
+        if len(cropped) == 0:
+            cropped = [enhanced_img]
 
-        if cropped_enhanced is None:
-            cropped_enhanced = enhanced_img
+        if len(cropped_enhanced) == 0:
+            cropped_enhanced = [enhanced_img]
 
         return enhanced_img, cropped, cropped_enhanced,
 
@@ -1486,6 +1517,7 @@ class SubtractMask:
 
 import nodes
 
+
 def get_image_hash(arr):
     split_index1 = arr.shape[0] // 2
     split_index2 = arr.shape[1] // 2
@@ -1502,7 +1534,6 @@ def get_image_hash(arr):
 
     return hash((sum1, sum2, sum3, sum4))
 
-preview_hash_map = {}
 
 class PreviewBridge(nodes.PreviewImage):
     @classmethod
@@ -1518,8 +1549,11 @@ class PreviewBridge(nodes.PreviewImage):
 
     CATEGORY = "ImpactPack/Util"
 
+    def __init__(self):
+        super().__init__()
+        self.prev_hash = None
+
     def doit(self, images, image, filename_prefix="ComfyUI", prompt=None, extra_pnginfo=None, unique_id=None):
-        global preview_hash_map
         if image != "#placeholder" and isinstance(image, str):
             image_path = folder_paths.get_annotated_filepath(image)
             img = Image.open(image_path).convert("RGB")
@@ -1530,8 +1564,8 @@ class PreviewBridge(nodes.PreviewImage):
             image_hash = get_image_hash(data)
 
         is_changed = False
-        if unique_id not in preview_hash_map or preview_hash_map[unique_id] != image_hash:
-            preview_hash_map[unique_id] = image_hash
+        if self.prev_hash is None or self.prev_hash != image_hash:
+            self.prev_hash = image_hash
             is_changed = True
 
         if is_changed or image == "#placeholder":
@@ -1928,6 +1962,34 @@ class SEGSSwitch:
             return (segs3_opt,)
         else:
             return (segs4_opt,)
+
+
+# class SEGPick:
+#     @classmethod
+#     def INPUT_TYPES(s):
+#         return {"required": {
+#                     "select": ("INT", {"default": 1, "min": 1, "max": 99999, "step": 1}),
+#                     "segs": ("SEGS",),
+#                     },
+#                 }
+#
+#     RETURN_TYPES = ("SEGS", )
+#
+#     OUTPUT_NODE = True
+#
+#     FUNCTION = "doit"
+#
+#     CATEGORY = "ImpactPack/Util"
+#
+#     def doit(self, select, segs):
+#         if select == 1:
+#             return (segs,)
+#         elif select == 2:
+#             return (segs2_opt,)
+#         elif select == 3:
+#             return (segs3_opt,)
+#         else:
+#             return (segs4_opt,)
 
 
 class SaveConditioning:
