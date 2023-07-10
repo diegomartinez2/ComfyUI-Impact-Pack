@@ -15,9 +15,43 @@ import comfy_extras.nodes_upscale_model as model_upscale
 from server import PromptServer
 import comfy
 import impact.wildcards as wildcards
+import math
 
 SEG = namedtuple("SEG", ['cropped_image', 'cropped_mask', 'confidence', 'crop_region', 'bbox', 'label'],
                  defaults=[None])
+
+
+def erosion_mask(mask, grow_mask_by):
+    w = mask.shape[1]
+    h = mask.shape[0]
+
+    mask = mask.clone()
+
+    mask2 = torch.nn.functional.interpolate(mask.reshape((-1, 1, mask.shape[-2], mask.shape[-1])), size=(w, h),
+                                            mode="bilinear")
+    if grow_mask_by == 0:
+        mask_erosion = mask2
+    else:
+        kernel_tensor = torch.ones((1, 1, grow_mask_by, grow_mask_by))
+        padding = math.ceil((grow_mask_by - 1) / 2)
+
+        mask_erosion = torch.clamp(torch.nn.functional.conv2d(mask2.round(), kernel_tensor, padding=padding), 0, 1)
+
+    return mask_erosion[:, :, :w, :h].round()
+
+
+class REGIONAL_PROMPT:
+    def __init__(self, mask, sampler):
+        self.mask = mask
+        self.sampler = sampler
+        self.mask_erosion = None
+        self.erosion_factor = None
+
+    def get_mask_erosion(self, factor):
+        if self.mask_erosion is None or self.erosion_factor != factor:
+            self.mask_erosion = erosion_mask(self.mask, factor)
+
+        return self.mask_erosion
 
 
 class NO_BBOX_DETECTOR:
@@ -215,12 +249,6 @@ def enhance_detail(image, model, clip, vae, guide_size, guide_size_for, max_size
             new_h = h
 
     print(f"Detailer: segment upscale for ({bbox_w, bbox_h}) | crop region {w, h} x {upscale} -> {new_w, new_h}")
-
-    # noise_mask
-    is_mask_all_zeros = (noise_mask == 0).all().item()
-    if is_mask_all_zeros:
-        print(f"Detailer: segment skip [empty mask]")
-        return None
 
     # upscale
     upscaled_image = scale_tensor(new_w, new_h, torch.from_numpy(image))

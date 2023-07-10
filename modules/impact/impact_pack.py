@@ -203,6 +203,12 @@ class SEGSDetailer:
             cropped_image = seg.cropped_image if seg.cropped_image is not None \
                                               else crop_ndarray4(image.numpy(), seg.crop_region)
 
+            is_mask_all_zeros = (seg.cropped_mask == 0).all().item()
+            if is_mask_all_zeros:
+                print(f"Detailer: segment skip [empty mask]")
+                new_segs.append(seg)
+                continue
+
             if noise_mask == "enabled":
                 cropped_mask = seg.cropped_mask
             else:
@@ -392,6 +398,11 @@ class DetailerForEach:
                                               else crop_ndarray4(image.numpy(), seg.crop_region)
 
             mask_pil = feather_mask(seg.cropped_mask, feather)
+
+            is_mask_all_zeros = (seg.cropped_mask == 0).all().item()
+            if is_mask_all_zeros:
+                print(f"Detailer: segment skip [empty mask]")
+                continue
 
             if noise_mask == "enabled":
                 cropped_mask = seg.cropped_mask
@@ -608,6 +619,110 @@ class TwoAdvancedSamplersForMask:
         return (new_latent_image, )
 
 
+class RegionalPrompt:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+                     "mask": ("MASK", ),
+                     "advanced_sampler": ("KSAMPLER_ADVANCED", ),
+                     },
+                }
+
+    RETURN_TYPES = ("REGIONAL_PROMPTS", )
+    FUNCTION = "doit"
+
+    CATEGORY = "ImpactPack/experimental"
+
+    def doit(self, mask, advanced_sampler):
+        regional_prompt = core.REGIONAL_PROMPT(mask, advanced_sampler)
+        return ([regional_prompt], )
+
+
+class CombineRegionalPrompts:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+                     "regional_prompts1": ("REGIONAL_PROMPTS", ),
+                     "regional_prompts2": ("REGIONAL_PROMPTS", ),
+                     },
+                }
+
+    RETURN_TYPES = ("REGIONAL_PROMPTS", )
+    FUNCTION = "doit"
+
+    CATEGORY = "ImpactPack/experimental"
+
+    def doit(self, regional_prompts1, regional_prompts2):
+        return (regional_prompts1 + regional_prompts2, )
+
+
+class RegionalSampler:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+                     "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
+                     "steps": ("INT", {"default": 20, "min": 1, "max": 10000}),
+                     "denoise": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                     "samples": ("LATENT", ),
+                     "base_sampler": ("KSAMPLER_ADVANCED", ),
+                     "regional_prompts": ("REGIONAL_PROMPTS", ),
+                     "overlap_factor": ("INT", {"default": 10, "min": 0, "max": 10000})
+                     },
+                }
+
+    RETURN_TYPES = ("LATENT", )
+    FUNCTION = "doit"
+
+    CATEGORY = "ImpactPack/experimental"
+
+    @staticmethod
+    def mask_erosion(samples, mask, grow_mask_by):
+        mask = mask.clone()
+
+        w = samples['samples'].shape[3]
+        h = samples['samples'].shape[2]
+
+        mask2 = torch.nn.functional.interpolate(mask.reshape((-1, 1, mask.shape[-2], mask.shape[-1])), size=(w, h), mode="bilinear")
+        if grow_mask_by == 0:
+            mask_erosion = mask2
+        else:
+            kernel_tensor = torch.ones((1, 1, grow_mask_by, grow_mask_by))
+            padding = math.ceil((grow_mask_by - 1) / 2)
+
+            mask_erosion = torch.clamp(torch.nn.functional.conv2d(mask2.round(), kernel_tensor, padding=padding), 0, 1)
+
+        return mask_erosion[:, :, :w, :h].round()
+
+    def doit(self, seed, steps, denoise, samples, base_sampler, regional_prompts, overlap_factor):
+
+        masks = [regional_prompt.mask.numpy() for regional_prompt in regional_prompts]
+        masks = [np.ceil(mask).astype(np.int32) for mask in masks]
+        combined_mask = torch.from_numpy(np.bitwise_or.reduce(masks))
+
+        inv_mask = torch.where(combined_mask == 0, torch.tensor(1.0), torch.tensor(0.0))
+
+        adv_steps = int(steps / denoise)
+        start_at_step = adv_steps - steps
+
+        new_latent_image = samples.copy()
+
+        for i in range(start_at_step, adv_steps):
+            add_noise = "enable" if i == start_at_step else "disable"
+            return_with_leftover_noise = "enable" if i+1 != adv_steps else "disable"
+
+            new_latent_image['noise_mask'] = inv_mask
+            new_latent_image = base_sampler.sample_advanced(add_noise, seed, adv_steps, new_latent_image, i, i + 1, "enable")
+
+            for regional_prompt in regional_prompts:
+                new_latent_image['noise_mask'] = regional_prompt.get_mask_erosion(overlap_factor)
+                new_latent_image = regional_prompt.sampler.sample_advanced("disable", seed, adv_steps, new_latent_image,
+                                                                           i, i + 1, return_with_leftover_noise)
+
+        del new_latent_image['noise_mask']
+
+        return (new_latent_image, )
+
+
 class FaceDetailer:
     @classmethod
     def INPUT_TYPES(s):
@@ -684,6 +799,12 @@ class FaceDetailer:
 
         # Mask Generator
         mask = core.segs_to_combined_mask(segs)
+
+        if len(cropped_enhanced) == 0:
+            image = Image.new("RGB", (64, 64))
+            draw = ImageDraw.Draw(image)
+            draw.rectangle((0, 0, 63, 63), fill=(0, 0, 0))
+            cropped_enhanced = [pil2tensor(image)]
 
         return enhanced_img, cropped_enhanced, mask
 
@@ -1219,6 +1340,12 @@ class FaceDetailerPipe:
             bbox_threshold, bbox_dilation, bbox_crop_factor,
             sam_detection_hint, sam_dilation, sam_threshold, sam_bbox_expansion, sam_mask_hint_threshold,
             sam_mask_hint_use_negative, drop_size, bbox_detector, wildcard, sam_model_opt)
+
+        if len(cropped_enhanced) == 0:
+            image = Image.new("RGB", (64, 64))
+            draw = ImageDraw.Draw(image)
+            draw.rectangle((0, 0, 63, 63), fill=(0, 0, 0))
+            cropped_enhanced = [pil2tensor(image)]
 
         return enhanced_img, cropped_enhanced, mask, detailer_pipe
 
