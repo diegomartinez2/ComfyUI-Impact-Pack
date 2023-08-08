@@ -1,7 +1,4 @@
 import os
-import mmcv
-from mmdet.apis import (inference_detector, init_detector)
-from mmdet.evaluation import get_classes
 from segment_anything import SamPredictor
 import torch.nn.functional as F
 
@@ -62,12 +59,6 @@ class NO_SEGM_DETECTOR:
     pass
 
 
-def load_mmdet(model_path):
-    model_config = os.path.splitext(model_path)[0] + ".py"
-    model = init_detector(model_config, model_path, device="cpu")
-    return model
-
-
 def create_segmasks(results):
     bboxs = results[1]
     segms = results[2]
@@ -77,90 +68,6 @@ def create_segmasks(results):
     for i in range(len(segms)):
         item = (bboxs[i], segms[i].astype(np.float32), confidence[i])
         results.append(item)
-    return results
-
-
-def inference_segm_old(model, image, conf_threshold):
-    image = image.numpy()[0] * 255
-    mmdet_results = inference_detector(model, image)
-
-    bbox_results, segm_results = mmdet_results
-    label = "A"
-
-    classes = get_classes("coco")
-    labels = [
-        np.full(bbox.shape[0], i, dtype=np.int32)
-        for i, bbox in enumerate(bbox_results)
-    ]
-    n, m = bbox_results[0].shape
-    if n == 0:
-        return [[], [], []]
-    labels = np.concatenate(labels)
-    bboxes = np.vstack(bbox_results)
-    segms = mmcv.concat_list(segm_results)
-    filter_idxs = np.where(bboxes[:, -1] > conf_threshold)[0]
-    results = [[], [], []]
-    for i in filter_idxs:
-        results[0].append(label + "-" + classes[labels[i]])
-        results[1].append(bboxes[i])
-        results[2].append(segms[i])
-
-    return results
-
-
-def inference_segm(image, modelname, conf_thres, lab="A"):
-    image = image.numpy()[0] * 255
-    mmdet_results = inference_detector(modelname, image).pred_instances
-    bboxes = mmdet_results.bboxes.numpy()
-    segms = mmdet_results.masks.numpy()
-    scores = mmdet_results.scores.numpy()
-
-    classes = get_classes("coco")
-
-    n, m = bboxes.shape
-    if n == 0:
-        return [[], [], [], []]
-    labels = mmdet_results.labels
-    filter_inds = np.where(mmdet_results.scores > conf_thres)[0]
-    results = [[], [], [], []]
-    for i in filter_inds:
-        results[0].append(lab + "-" + classes[labels[i]])
-        results[1].append(bboxes[i])
-        results[2].append(segms[i])
-        results[3].append(scores[i])
-
-    return results
-
-
-def inference_bbox(modelname, image, conf_threshold):
-    image = image.numpy()[0] * 255
-    label = "A"
-    output = inference_detector(modelname, image).pred_instances
-    cv2_image = np.array(image)
-    cv2_image = cv2_image[:, :, ::-1].copy()
-    cv2_gray = cv2.cvtColor(cv2_image, cv2.COLOR_BGR2GRAY)
-
-    segms = []
-    for x0, y0, x1, y1 in output.bboxes:
-        cv2_mask = np.zeros(cv2_gray.shape, np.uint8)
-        cv2.rectangle(cv2_mask, (int(x0), int(y0)), (int(x1), int(y1)), 255, -1)
-        cv2_mask_bool = cv2_mask.astype(bool)
-        segms.append(cv2_mask_bool)
-
-    n, m = output.bboxes.shape
-    if n == 0:
-        return [[], [], [], []]
-
-    bboxes = output.bboxes.numpy()
-    scores = output.scores.numpy()
-    filter_idxs = np.where(scores > conf_threshold)[0]
-    results = [[], [], [], []]
-    for i in filter_idxs:
-        results[0].append(label)
-        results[1].append(bboxes[i])
-        results[2].append(segms[i])
-        results[3].append(scores[i])
-
     return results
 
 
@@ -201,7 +108,7 @@ def gen_negative_hints(w, h, x1, y1, x2, y2):
     return npoints, nplabs
 
 
-def enhance_detail(image, model, clip, vae, guide_size, guide_size_for, max_size, bbox, seed, steps, cfg, sampler_name,
+def enhance_detail(image, model, clip, vae, guide_size, guide_size_for_bbox, max_size, bbox, seed, steps, cfg, sampler_name,
                    scheduler, positive, negative, denoise, noise_mask, force_inpaint, wildcard_opt=None):
     if wildcard_opt is not None and wildcard_opt != "":
         model, positive = wildcards.process_with_loras(wildcard_opt, model, clip)
@@ -217,7 +124,7 @@ def enhance_detail(image, model, clip, vae, guide_size, guide_size_for, max_size
         print(f"Detailer: segment skip (enough big)")
         return None
 
-    if guide_size_for == "bbox":
+    if guide_size_for_bbox: # == "bbox"
         # Scale up based on the smaller dimension between width and height.
         upscale = guide_size / min(bbox_w, bbox_h)
     else:
@@ -669,57 +576,7 @@ def apply_mask_to_each_seg(segs, masks):
     return segs[0], items
 
 
-class BBoxDetector:
-    bbox_model = None
-
-    def __init__(self, bbox_model):
-        self.bbox_model = bbox_model
-
-    def detect(self, image, threshold, dilation, crop_factor, drop_size=1):
-        drop_size = max(drop_size, 1)
-        mmdet_results = inference_bbox(self.bbox_model, image, threshold)
-        segmasks = create_segmasks(mmdet_results)
-
-        if dilation > 0:
-            segmasks = dilate_masks(segmasks, dilation)
-
-        items = []
-        h = image.shape[1]
-        w = image.shape[2]
-
-        for x in segmasks:
-            item_bbox = x[0]
-            item_mask = x[1]
-
-            y1, x1, y2, x2 = item_bbox
-
-            if x2 - x1 > drop_size and y2 - y1 > drop_size:  # minimum dimension must be (2,2) to avoid squeeze issue
-                crop_region = make_crop_region(w, h, item_bbox, crop_factor)
-                cropped_image = crop_image(image, crop_region)
-                cropped_mask = crop_ndarray2(item_mask, crop_region)
-                confidence = x[2]
-                # bbox_size = (item_bbox[2]-item_bbox[0],item_bbox[3]-item_bbox[1]) # (w,h)
-
-                item = SEG(cropped_image, cropped_mask, confidence, crop_region, item_bbox)
-
-                items.append(item)
-
-        shape = image.shape[1], image.shape[2]
-        return shape, items
-
-    def detect_combined(self, image, threshold, dilation):
-        mmdet_results = inference_bbox(self.bbox_model, image, threshold)
-        segmasks = create_segmasks(mmdet_results)
-        if dilation > 0:
-            segmasks = dilate_masks(segmasks, dilation)
-
-        return combine_masks(segmasks)
-
-    def setAux(self, x):
-        pass
-
-
-class ONNXDetector(BBoxDetector):
+class ONNXDetector:
     onnx_model = None
 
     def __init__(self, onnx_model):
@@ -769,52 +626,6 @@ class ONNXDetector(BBoxDetector):
         pass
 
 
-class SegmDetector(BBoxDetector):
-    segm_model = None
-
-    def __init__(self, segm_model):
-        self.segm_model = segm_model
-
-    def detect(self, image, threshold, dilation, crop_factor, drop_size=1):
-        drop_size = max(drop_size, 1)
-        mmdet_results = inference_segm(image, self.segm_model, threshold)
-        segmasks = create_segmasks(mmdet_results)
-
-        if dilation > 0:
-            segmasks = dilate_masks(segmasks, dilation)
-
-        items = []
-        h = image.shape[1]
-        w = image.shape[2]
-        for x in segmasks:
-            item_bbox = x[0]
-            item_mask = x[1]
-
-            y1, x1, y2, x2 = item_bbox
-
-            if x2 - x1 > drop_size and y2 - y1 > drop_size:  # minimum dimension must be (2,2) to avoid squeeze issue
-                crop_region = make_crop_region(w, h, item_bbox, crop_factor)
-                cropped_image = crop_image(image, crop_region)
-                cropped_mask = crop_ndarray2(item_mask, crop_region)
-                confidence = x[2]
-
-                item = SEG(cropped_image, cropped_mask, confidence, crop_region, item_bbox)
-                items.append(item)
-
-        return image.shape, items
-
-    def detect_combined(self, image, threshold, dilation):
-        mmdet_results = inference_bbox(self.bbox_model, image, threshold)
-        segmasks = create_segmasks(mmdet_results)
-        if dilation > 0:
-            segmasks = dilate_masks(segmasks, dilation)
-
-        return combine_masks(segmasks)
-
-    def setAux(self, x):
-        pass
-
-
 def mask_to_segs(mask, combined, crop_factor, bbox_fill, drop_size=1):
     drop_size = max(drop_size, 1)
     if mask is None:
@@ -844,7 +655,7 @@ def mask_to_segs(mask, combined, crop_factor, bbox_fill, drop_size=1):
     for i in range(mask.shape[0]):
         mask_i = mask[i]
 
-        if combined == "True":
+        if combined:
             indices = np.nonzero(mask_i)
             if len(indices[0]) > 0 and len(indices[1]) > 0:
                 bbox = (
@@ -865,19 +676,22 @@ def mask_to_segs(mask, combined, crop_factor, bbox_fill, drop_size=1):
                         result.append(item)
 
         else:
-            labelled_mask = label(mask_i)
-            regions = regionprops(labelled_mask)
+            mask_i_uint8 = (mask_i * 255.0).astype(np.uint8)
+            contours, _ = cv2.findContours(mask_i_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            for contour in contours:
+                separated_mask = np.zeros_like(mask_i_uint8)
+                cv2.drawContours(separated_mask, [contour], 0, 255, -1)
+                separated_mask = np.array(separated_mask/255.0).astype(np.float32)
 
-            for region in regions:
-                y1, x1, y2, x2 = region.bbox
-                bbox = x1, y1, x2, y2
+                x, y, w, h = cv2.boundingRect(contour)
+                bbox = x, y, x+w, y+h
                 crop_region = make_crop_region(
                     mask_i.shape[1], mask_i.shape[0], bbox, crop_factor
                 )
 
-                if x2 - x1 > drop_size and y2 - y1 > drop_size:
+                if w > drop_size and h > drop_size:
                     cropped_mask = np.array(
-                        mask_i[
+                        separated_mask[
                             crop_region[1]: crop_region[3],
                             crop_region[0]: crop_region[2],
                         ]
@@ -914,6 +728,23 @@ def segs_to_combined_mask(segs):
         mask[crop_region[1]:crop_region[3], crop_region[0]:crop_region[2]] |= (cropped_mask * 255).astype(np.uint8)
 
     return torch.from_numpy(mask.astype(np.float32) / 255.0)
+
+
+def segs_to_masklist(segs):
+    shape = segs[0]
+    h = shape[0]
+    w = shape[1]
+
+    masks = []
+    for seg in segs[1]:
+        mask = np.zeros((h, w), dtype=np.uint8)
+        cropped_mask = seg.cropped_mask
+        crop_region = seg.crop_region
+        mask[crop_region[1]:crop_region[3], crop_region[0]:crop_region[2]] |= (cropped_mask * 255).astype(np.uint8)
+        mask = torch.from_numpy(mask.astype(np.float32) / 255.0)
+        masks.append(mask)
+
+    return masks
 
 
 def vae_decode(vae, samples, use_tile, hook):
@@ -1408,7 +1239,7 @@ except:
 
 # REQUIREMENTS: biegert/ComfyUI-CLIPSeg
 try:
-    class BBoxDetectorBasedOnCLIPSeg(BBoxDetector):
+    class BBoxDetectorBasedOnCLIPSeg:
         prompt = None
         blur = None
         threshold = None

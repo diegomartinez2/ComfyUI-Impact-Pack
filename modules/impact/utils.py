@@ -73,9 +73,10 @@ def bitwise_and_masks(mask1, mask2):
         return mask1
 
 
-def to_binary_mask(mask):
+def to_binary_mask(mask, threshold):
     mask = mask.clone().cpu()
-    mask[mask != 0] = 1.
+    mask[mask > threshold] = 1.
+    mask[mask <= threshold] = 0.
     return mask
 
 
@@ -119,6 +120,20 @@ def subtract_masks(mask1, mask2):
 
     if cv2_mask1.shape == cv2_mask2.shape:
         cv2_mask = cv2.subtract(cv2_mask1, cv2_mask2)
+        return torch.from_numpy(cv2_mask) / 255.0
+    else:
+        # do nothing - incompatible mask shape: mostly empty mask
+        return mask1
+
+
+def add_masks(mask1, mask2):
+    mask1 = mask1.cpu()
+    mask2 = mask2.cpu()
+    cv2_mask1 = np.array(mask1) * 255
+    cv2_mask2 = np.array(mask2) * 255
+
+    if cv2_mask1.shape == cv2_mask2.shape:
+        cv2_mask = cv2.add(cv2_mask1, cv2_mask2)
         return torch.from_numpy(cv2_mask) / 255.0
     else:
         # do nothing - incompatible mask shape: mostly empty mask
@@ -210,7 +225,7 @@ def scale_tensor_and_to_pil(w, h, image):
     return image.resize((w, h), resample=LANCZOS)
 
 
-def empty_pil(w=64, h=64):
+def empty_pil_tensor(w=64, h=64):
     image = Image.new("RGB", (w, h))
     draw = ImageDraw.Draw(image)
     draw.rectangle((0, 0, w-1, h-1), fill=(0, 0, 0))
