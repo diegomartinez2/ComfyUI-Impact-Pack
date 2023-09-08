@@ -6,6 +6,10 @@ from PIL import Image, ImageDraw, ImageFilter
 LANCZOS = (Image.Resampling.LANCZOS if hasattr(Image, 'Resampling') else Image.LANCZOS)
 
 
+def pil2numpy(image):
+    return (np.array(image).astype(np.float32) / 255.0)[np.newaxis, :, :, :]
+
+
 def pil2tensor(image):
     return torch.from_numpy(np.array(image).astype(np.float32) / 255.0).unsqueeze(0)
 
@@ -73,7 +77,7 @@ def bitwise_and_masks(mask1, mask2):
         return mask1
 
 
-def to_binary_mask(mask, threshold):
+def to_binary_mask(mask, threshold=0):
     mask = mask.clone().cpu()
     mask[mask > threshold] = 1.
     mask[mask <= threshold] = 0.
@@ -120,7 +124,7 @@ def subtract_masks(mask1, mask2):
 
     if cv2_mask1.shape == cv2_mask2.shape:
         cv2_mask = cv2.subtract(cv2_mask1, cv2_mask2)
-        return torch.from_numpy(cv2_mask) / 255.0
+        return torch.clamp(torch.from_numpy(cv2_mask) / 255.0, min=0, max=1)
     else:
         # do nothing - incompatible mask shape: mostly empty mask
         return mask1
@@ -134,7 +138,7 @@ def add_masks(mask1, mask2):
 
     if cv2_mask1.shape == cv2_mask2.shape:
         cv2_mask = cv2.add(cv2_mask1, cv2_mask2)
-        return torch.from_numpy(cv2_mask) / 255.0
+        return torch.clamp(torch.from_numpy(cv2_mask) / 255.0, min=0, max=1)
     else:
         # do nothing - incompatible mask shape: mostly empty mask
         return mask1
@@ -238,3 +242,11 @@ class NonListIterable:
 
     def __getitem__(self, index):
         return self.data[index]
+
+
+# wildcard trick is taken from pythongossss's
+class AnyType(str):
+    def __ne__(self, __value: object) -> bool:
+        return False
+
+any_typ = AnyType("*")

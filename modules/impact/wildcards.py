@@ -9,7 +9,7 @@ wildcard_dict = {}
 
 def read_wildcard_dict(wildcard_path):
     global wildcard_dict
-    for root, directories, files in os.walk(wildcard_path):
+    for root, directories, files in os.walk(wildcard_path, followlinks=True):
         for file in files:
             if file.endswith('.txt'):
                 file_path = os.path.join(root, file)
@@ -23,16 +23,36 @@ def read_wildcard_dict(wildcard_path):
     return wildcard_dict
 
 
-def process(text):
+def process(text, seed=None):
+    if seed is not None:
+        random.seed(seed)
+
     def replace_options(string):
         replacements_found = False
 
         def replace_option(match):
             nonlocal replacements_found
             options = match.group(1).split('|')
-            replacement = random.choice(options)
+
+            adjusted_probabilities = []
+
+            total_prob = 0
+
+            for option in options:
+                parts = option.split('::', 1)
+                if len(parts) == 2 and parts[0].isdigit():
+                    config_value = int(parts[0])
+                else:
+                    config_value = 1  # Default value if no configuration is provided
+
+                adjusted_probabilities.append(config_value)
+                total_prob += config_value
+
+            normalized_probabilities = [prob / total_prob for prob in adjusted_probabilities]
+
+            replacement = random.choices(options, weights=normalized_probabilities, k=1)[0]
             replacements_found = True
-            return replacement
+            return re.sub(r'^[0-9]+::', '', replacement, 1)
 
         pattern = r'{([^{}]*?)}'
         replaced_string = re.sub(pattern, replace_option, string)
@@ -44,7 +64,7 @@ def process(text):
 
     def replace_wildcard(string):
         global wildcard_dict
-        pattern = r"__([\w.-/]+)__"
+        pattern = r"__([\w.\-/]+)__"
         matches = re.findall(pattern, string)
 
         replacements_found = False
@@ -99,6 +119,7 @@ def extract_lora_values(string):
         elif len(item) == 2:
             lora = item[0]
             a = safe_float(item[1])
+            b = a  # When only one weight is provided, use the same weight for model as well as clip - similar to Automatic1111
         elif len(item) >= 3:
             lora = item[0]
             if item[1] != '':
@@ -136,5 +157,5 @@ def process_with_loras(wildcard_opt, model, clip):
             print(f"LORA NOT FOUND: {lora_name}")
 
     print(f"CLIP: {pass2}")
-    return model, nodes.CLIPTextEncode().encode(clip, pass2)[0]
+    return model, clip, nodes.CLIPTextEncode().encode(clip, pass2)[0]
 

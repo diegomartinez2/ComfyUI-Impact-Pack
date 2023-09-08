@@ -7,6 +7,7 @@ This custom node helps to conveniently enhance images through Detector, Detailer
 
 
 ## NOTICE
+* Selection weight syntax is changed(: -> ::) since V3.16. ([tutorial](https://github.com/ltdrdata/ComfyUI-extension-tutorials/blob/Main/ComfyUI-Impact-Pack/tutorial/ImpactWildcardProcessor.md))
 * Starting from V3.6, requires latest version(Aug 8, 9ccc965) of ComfyUI.
 * **In versions below V3.3.1, there was an issue with the image quality generated after using the UltralyticsDetectorProvider. Please make sure to upgrade to a newer version.**
 * Starting from V3.0, nodes related to `mmdet` are optional nodes that are activated only based on the configuration settings.
@@ -32,6 +33,10 @@ This custom node helps to conveniently enhance images through Detector, Detailer
 * SAMDetector (Segmented) - It is similar to `SAMDetector (combined)`, but it separates and outputs the detected segments. Multiple segments can be found for the same detected area, and currently, a policy is in place to group them arbitrarily in sets of three. This aspect is expected to be improved in the future.
   * As a result, it outputs the `combined_mask`, which is a unified mask, and `batch_masks`, which are multiple masks grouped together in batch form.
   * While `batch_masks` may not be completely separated, it provides functionality to perform some level of segmentation.
+* Simple Detector (SEGS) - Operating primarily with `BBOX_DETECTOR`, and with the additional provision of `SAM_MODEL` or `SEGM_DETECTOR`, this node internally generates improved SEGS through mask operations on both *bbox* and *silhouette*. It serves as a convenient tool to simplify a somewhat intricate workflow.
+
+* ControlNetApply (SEGS) - To apply ControlNet in SEGS, you need to use the Preprocessor Provider node from the Inspire Pack to utilize this node.
+
 * Bitwise(SEGS & SEGS) - Performs a 'bitwise and' operation between two SEGS.
 * Bitwise(SEGS - SEGS) - Subtracts one SEGS from another.
 * Bitwise(SEGS & MASK) - Performs a bitwise AND operation between SEGS and MASK.
@@ -55,6 +60,8 @@ This custom node helps to conveniently enhance images through Detector, Detailer
 * FaceDetailer - Easily detects faces and improves them.
 * FaceDetailer (pipe) - Easily detects faces and improves them (for multipass).
 
+* `FromDetailer (SDXL/pipe), BasicPipe -> DetailerPipe (SDXL), Edit DetailerPipe (SDXL)` - These are pipe functions used in Detailer for utilizing the refiner model of SDXL.
+
 * SEGSDetailer - Performs detailed work on SEGS without pasting it back onto the original image.
 * SEGSPaste - Pastes the results of SEGS onto the original image.
   * If `ref_image_opt` is present, the images contained within SEGS are ignored. Instead, the image within `ref_image_opt` corresponding to the crop area of SEGS is taken and pasted. The size of the image in `ref_image_opt` should be the same as the original image size. 
@@ -77,12 +84,18 @@ This custom node helps to conveniently enhance images through Detector, Detailer
 * PixelKSampleUpscalerProvider - An upscaler is provided that converts latent to pixels using VAEDecode, performs upscaling, converts back to latent using VAEEncode, and then performs k-sampling. This upscaler can be attached to nodes such as 'Iterative Upscale' for use.
   * Similar to 'Latent Scale (on Pixel Space)', if upscale_model_opt is provided, it performs pixel upscaling using the model.
 * PixelTiledKSampleUpscalerProvider - It is similar to PixelKSampleUpscalerProvider, but it uses ComfyUI_TiledKSampler and Tiled VAE Decoder/Encoder to avoid GPU VRAM issues at high resolutions.
-  * You need to install the [ComfyUI_TiledKSampler](https://github.com/BlenderNeko/ComfyUI_TiledKSampler) node extension.
+  * You need to install the [BlenderNeko/ComfyUI_TiledKSampler](https://github.com/BlenderNeko/ComfyUI_TiledKSampler) node extension.
 
 * DenoiseScheduleHookProvider - IterativeUpscale provides a hook that gradually changes the denoise to target_denoise as the step progresses.
 * CfgScheduleHookProvider - IterativeUpscale provides a hook that gradually changes the cfg to target_cfg as the step progresses.
 * PixelKSampleHookCombine - This is used to connect two PK_HOOKs. hook1 is executed first and then hook2 is executed.
   * If you want to simultaneously change cfg and denoise, you can combine the PK_HOOKs of CfgScheduleHookProvider and PixelKSampleHookCombine.
+* NoiseInjectionHookProvider - During each iteration of IterativeUpscale, noise is injected into the latent space while varying the strength according to a schedule.
+  * You need to install the [BlenderNeko/ComfyUI_Noise](https://github.com/BlenderNeko/ComfyUI_Noise) node extension.
+  * The seed serves as the initial value required for generating noise, and it increments by 1 with each iteration as the process unfolds.
+  * The source determines the types of CPU noise and GPU noise to be configured.
+  * Currently, there is only a simple schedule available, where the strength of the noise varies from start_strength to end_strength during the progression of each iteration.
+* NoiseInjectionDetailerHookProvider - The `detailer_hook` is a hook in the `Detailer` that injects noise during the processing of each SEGS.
 
 * Iterative Upscale (Latent) - The upscaler takes the input upscaler and splits the scale_factor into steps, then iteratively performs upscaling. 
 This takes latent as input and outputs latent as the result.
@@ -93,7 +106,7 @@ This takes latent as input and outputs latent as the result.
   * Note: The latent encoded through VAEEncodeForInpaint cannot be used.
 * KSamplerProvider - This is a wrapper that enables KSampler to be used in TwoSamplersForMask TwoSamplersForMaskUpscalerProvider.
 * TiledKSamplerProvider - ComfyUI_TiledKSampler is a wrapper that provides KSAMPLER.
-  * You need to install the [ComfyUI_TiledKSampler](https://github.com/BlenderNeko/ComfyUI_TiledKSampler) node extension.
+  * You need to install the [BlenderNeko/ComfyUI_TiledKSampler](https://github.com/BlenderNeko/ComfyUI_TiledKSampler) node extension.
   
 * TwoAdvancedSamplersForMask - TwoSamplersForMask is similar to TwoAdvancedSamplersForMask, but they differ in their operation. TwoSamplersForMask performs sampling in the mask area only after all the samples in the base area are finished. On the other hand, TwoAdvancedSamplersForMask performs sampling in both the base area and the mask area sequentially at each step.
 * KSamplerAdvancedProvider - This is a wrapper that enables KSampler to be used in TwoAdvancedSamplersForMask.
@@ -110,20 +123,22 @@ This takes latent as input and outputs latent as the result.
 * Switch (image,mask), Switch (latent), Switch (SEGS) - Among multiple inputs, it selects the input designated by the selector and outputs it. The first input must be provided, while the others are optional. However, if the input specified by the selector is not connected, an error may occur.
 * ImpactWildcardProcessor - The text is generated by processing the wildcard in the Text. If the mode is set to "populate", a dynamic prompt is generated with each execution and the input is filled in the second textbox. If the mode is set to "fixed", the content of the second textbox remains unchanged.
   * When an image is generated with the "fixed" mode, the prompt used for that particular generation is stored in the metadata.
-  * Known Issue: The old version of `presetText.js` script from **pythongosssss's [ComfyUI-Custom-Scripts](https://github.com/pythongosssss/ComfyUI-Custom-Scripts)** is causing a conflict, preventing it from being used together.
-                 If you'd installed that extension before (Jul 23, 2023). Please update to latest version.
+* ImpactWildcardEncode - Similar to ImpactWildcardProcessor, this provides the loading functionality of LoRAs (e.g. `<lora:some_awesome_lora:0.7:1.2>`). Populated prompts are encoded using the clip after all the lora loading is done.
 
 * RegionalSampler, CombineRegionalPrompts, RegionalPrompt - experimental feature
 - multiple region version of TwoAdvancedSamplersForMask 
-* 
+
 * KSampler (pipe), KSampler (advanced/pipe)
 
 * ImpactCompare, ImpactConditionalBranch, ImpactInt, ImpactValueSender, ImpactValueReceiver, ImpactImageInfo, ImpactMinMax, ImpactNeg, ImpactConditionalStopIteration
 - Experimental set of nodes for implementing loop functionality (tutorial to be prepared later / [example workflow](test/loop-test.json)).
 
 * Image batch To Image List - Convert Image batch to Image List
-- You can use images generated in a multi batch to handle them.
+- You can use images generated in a multi batch to handle them
+* Make Image List - Convert multiple images into a single image list
+- The input of images can be scaled up as needed
 
+* String Selector - It selects and returns a portion of the string. When `multiline` mode is disabled, it simply returns the string of the line pointed to by the selector. When `multiline` mode is enabled, it divides the string based on lines that start with `#` and returns them. If the `select` value is larger than the number of items, it will start counting from the first line again and return accordingly.
 
 ## MMDet nodes
 * MMDetDetectorProvider - Loads the MMDet model to provide BBOX_DETECTOR and SEGM_DETECTOR.
@@ -132,7 +147,7 @@ This takes latent as input and outputs latent as the result.
 
 ## Feature
 * Interactive SAM Detector (Clipspace) - When you right-click on a node that has 'MASK' and 'IMAGE' outputs, a context menu will open. From this menu, you can either open a dialog to create a SAM Mask using 'Open in SAM Detector', or copy the content (likely mask data) using 'Copy (Clipspace)' and generate a mask using 'Impact SAM Detector' from the clipspace menu, and then paste it using 'Paste (Clipspace)'.
-
+* Providing a feature to detect errors that occur when mixing models and clips from checkpoints such as `SDXL Base`, `SDXL Refiner`, `SD1.x`, `SD2.x` during sample execution, and reporting appropriate errors.
 
 ## Deprecated
 * The following nodes have been kept only for compatibility with existing workflows, and are no longer supported. Please replace them with new nodes.
@@ -171,7 +186,7 @@ mmdet_skip = False
    * Impact Pack will automatically download subpack during its initial launch.
 5. (optional) `python install.py`
    * Impact Pack will automatically install its dependencies during its initial launch.
-   * For the portable version, you should execute the command `..\..\..\python_embedded\python.exe install.py` to run the installation script.
+   * For the portable version, you should execute the command `..\..\..\python_embeded\python.exe install.py` to run the installation script.
 
 
 6. Restart ComfyUI
@@ -196,6 +211,24 @@ mmdet_skip = False
 * linux packages (ubuntu)
   * libgl1-mesa-glx
   * libglib2.0-0
+
+
+## Config example
+* Once you run the Impact Pack for the first time, an `impact-pack.ini` file will be automatically generated in the Impact Pack directory. You can modify this configuration file to customize the default behavior.
+  * `dependency_version` - don't touch this
+  * `mmdet_skip` - disable MMDet based nodes and legacy nodes if `True`
+  * `sam_editor_cpu` - use cpu for `SAM editor` instead of gpu
+  * sam_editor_model: Specify the SAM model for the SAM editor.
+    * You can download various SAM models using ComfyUI-Manager.
+    * Path to SAM model: `ComfyUI/models/sams`
+```
+[default]
+dependency_version = 9
+mmdet_skip = True
+sam_editor_cpu = False
+sam_editor_model = sam_vit_b_01ec64.pth
+```
+
 
 ## Other Materials (auto-download on initial startup)
 

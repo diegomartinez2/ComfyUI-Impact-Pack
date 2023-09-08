@@ -1,3 +1,10 @@
+"""
+@author: Dr.Lt.Data
+@title: Impact Pack
+@nickname: Impact Pack
+@description: This extension offers various detector nodes and detailer nodes that allow you to configure a workflow that automatically enhances facial details. And provide iterative upscaler.
+"""
+
 import shutil
 import folder_paths
 import os
@@ -5,16 +12,16 @@ import sys
 
 comfy_path = os.path.dirname(folder_paths.__file__)
 impact_path = os.path.join(os.path.dirname(__file__))
-subpack_path = os.path.join(os.path.dirname(__file__), "subpack")
+subpack_path = os.path.join(os.path.dirname(__file__), "impact_subpack")
 modules_path = os.path.join(os.path.dirname(__file__), "modules")
 wildcards_path = os.path.join(os.path.dirname(__file__), "wildcards")
 custom_wildcards_path = os.path.join(os.path.dirname(__file__), "custom_wildcards")
 
 sys.path.append(modules_path)
-sys.path.append(subpack_path)
 
 
 import impact.config
+import impact.hacky
 print(f"### Loading: ComfyUI-Impact-Pack ({impact.config.version})")
 
 
@@ -26,10 +33,11 @@ def do_install():
 
 
 # ensure dependency
-if impact.config.get_config()['dependency_version'] < impact.config.dependency_version:
+if impact.config.get_config()['dependency_version'] < impact.config.dependency_version or not os.path.exists(subpack_path):
     print(f"## ComfyUI-Impact-Pack: Updating dependencies")
     do_install()
 
+sys.path.append(subpack_path)
 
 # Core
 # recheck dependencies for colab
@@ -58,24 +66,28 @@ except:
 import impact.impact_server  # to load server api
 
 def setup_js():
-    # remove garbage
-    old_js_path = os.path.join(comfy_path, "web", "extensions", "core", "impact-pack.js")
-    if os.path.exists(old_js_path):
-        os.remove(old_js_path)
-
-    # setup js
+    import nodes
     js_dest_path = os.path.join(comfy_path, "web", "extensions", "impact-pack")
-    if not os.path.exists(js_dest_path):
-        os.makedirs(js_dest_path)
 
-    js_src_path = os.path.join(impact_path, "js", "impact-pack.js")
-    shutil.copy(js_src_path, js_dest_path)
+    if hasattr(nodes, "EXTENSION_WEB_DIRS"):
+        if os.path.exists(js_dest_path):
+            shutil.rmtree(js_dest_path)
+    else:
+        print(f"[WARN] ComfyUI-Impact-Pack: Your ComfyUI version is outdated. Please update to the latest version.")
+        # setup js
+        if not os.path.exists(js_dest_path):
+            os.makedirs(js_dest_path)
 
-    js_src_path = os.path.join(impact_path, "js", "impact-sam-editor.js")
-    shutil.copy(js_src_path, js_dest_path)
+        js_src_path = os.path.join(impact_path, "js", "impact-pack.js")
+        shutil.copy(js_src_path, js_dest_path)
 
-    js_src_path = os.path.join(impact_path, "js", "comboBoolMigration.js")
-    shutil.copy(js_src_path, js_dest_path)
+        js_src_path = os.path.join(impact_path, "js", "impact-sam-editor.js")
+        shutil.copy(js_src_path, js_dest_path)
+
+        js_src_path = os.path.join(impact_path, "js", "comboBoolMigration.js")
+        shutil.copy(js_src_path, js_dest_path)
+
+
     
 setup_js()
 
@@ -83,6 +95,7 @@ from impact.impact_pack import *
 from impact.detectors import *
 from impact.pipe import *
 from impact.logics import *
+from impact.util_nodes import *
 
 impact.wildcards.read_wildcard_dict(wildcards_path)
 impact.wildcards.read_wildcard_dict(custom_wildcards_path)
@@ -107,15 +120,19 @@ NODE_CLASS_MAPPINGS = {
     "FaceDetailerPipe": FaceDetailerPipe,
 
     "ToDetailerPipe": ToDetailerPipe,
+    "ToDetailerPipeSDXL": ToDetailerPipeSDXL,
     "FromDetailerPipe": FromDetailerPipe,
     "FromDetailerPipe_v2": FromDetailerPipe_v2,
+    "FromDetailerPipeSDXL": FromDetailerPipe_SDXL,
     "ToBasicPipe": ToBasicPipe,
     "FromBasicPipe": FromBasicPipe,
     "FromBasicPipe_v2": FromBasicPipe_v2,
     "BasicPipeToDetailerPipe": BasicPipeToDetailerPipe,
+    "BasicPipeToDetailerPipeSDXL": BasicPipeToDetailerPipeSDXL,
     "DetailerPipeToBasicPipe": DetailerPipeToBasicPipe,
     "EditBasicPipe": EditBasicPipe,
     "EditDetailerPipe": EditDetailerPipe,
+    "EditDetailerPipeSDXL": EditDetailerPipeSDXL,
 
     "LatentPixelScale": LatentPixelScale,
     "PixelKSampleUpscalerProvider": PixelKSampleUpscalerProvider,
@@ -130,6 +147,8 @@ NODE_CLASS_MAPPINGS = {
     "PixelKSampleHookCombine": PixelKSampleHookCombine,
     "DenoiseScheduleHookProvider": DenoiseScheduleHookProvider,
     "CfgScheduleHookProvider": CfgScheduleHookProvider,
+    "NoiseInjectionHookProvider": NoiseInjectionHookProvider,
+    "NoiseInjectionDetailerHookProvider": NoiseInjectionDetailerHookProvider,
 
     "BitwiseAndMask": BitwiseAndMask,
     "SubtractMask": SubtractMask,
@@ -145,6 +164,9 @@ NODE_CLASS_MAPPINGS = {
     "BboxDetectorSEGS": BboxDetectorForEach,
     "SegmDetectorSEGS": SegmDetectorForEach,
     "ONNXDetectorSEGS": ONNXDetectorForEach,
+    "ImpactSimpleDetectorSEGS": SimpleDetectorForEach,
+    "ImpactSimpleDetectorSEGSPipe": SimpleDetectorForEachPipe,
+    "ImpactControlNetApplySEGS": ControlNetApplySEGS,
 
     "BboxDetectorCombined_v2": BboxDetectorCombined,
     "SegmDetectorCombined_v2": SegmDetectorCombined,
@@ -163,14 +185,15 @@ NODE_CLASS_MAPPINGS = {
     "LatentSender": LatentSender,
     "LatentReceiver": LatentReceiver,
     "ImageMaskSwitch": ImageMaskSwitch,
-    "LatentSwitch": LatentSwitch,
-    "SEGSSwitch": SEGSSwitch,
+    "LatentSwitch": GeneralSwitch,
+    "SEGSSwitch": GeneralSwitch,
+    "ImpactSwitch": GeneralSwitch,
 
     # "SaveConditioning": SaveConditioning,
     # "LoadConditioning": LoadConditioning,
 
     "ImpactWildcardProcessor": ImpactWildcardProcessor,
-    "ImpactLogger": ImpactLogger,
+    "ImpactWildcardEncode": ImpactWildcardEncode,
 
     "SEGSDetailer": SEGSDetailer,
     "SEGSPaste": SEGSPaste,
@@ -179,9 +202,6 @@ NODE_CLASS_MAPPINGS = {
     "ImpactSEGSToMaskList": SEGSToMaskList,
     "ImpactSEGSConcat": SEGSConcat,
 
-    # "SEGPick": SEGPick,
-    # "SEGEdit": SEGEdit,
-
     "ImpactKSamplerBasicPipe": KSamplerBasicPipe,
     "ImpactKSamplerAdvancedBasicPipe": KSamplerAdvancedBasicPipe,
 
@@ -189,6 +209,7 @@ NODE_CLASS_MAPPINGS = {
     "ReencodeLatentPipe": ReencodeLatentPipe,
 
     "ImpactImageBatchToImageList": ImageBatchToImageList,
+    "ImpactMakeImageList": MakeImageList,
 
     "RegionalSampler": RegionalSampler,
     "CombineRegionalPrompts": CombineRegionalPrompts,
@@ -208,6 +229,12 @@ NODE_CLASS_MAPPINGS = {
     "ImpactMinMax": ImpactMinMax,
     "ImpactNeg": ImpactNeg,
     "ImpactConditionalStopIteration": ImpactConditionalStopIteration,
+    "ImpactStringSelector": StringSelector,
+
+    "RemoveNoiseMask": RemoveNoiseMask,
+
+    "ImpactLogger": ImpactLogger,
+    "ImpactDummyInput": ImpactDummyInput,
 }
 
 
@@ -215,6 +242,10 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "BboxDetectorSEGS": "BBOX Detector (SEGS)",
     "SegmDetectorSEGS": "SEGM Detector (SEGS)",
     "ONNXDetectorSEGS": "ONNX Detector (SEGS)",
+    "ImpactSimpleDetectorSEGS": "Simple Detector (SEGS)",
+    "ImpactSimpleDetectorSEGSPipe": "Simple Detector (SEGS/pipe)",
+    "ImpactControlNetApplySEGS": "ControlNetApply (SEGS)",
+
     "BboxDetectorCombined_v2": "BBOX Detector (combined)",
     "SegmDetectorCombined_v2": "SEGM Detector (combined)",
     "SegsToCombinedMask": "SEGS to MASK (combined)",
@@ -233,6 +264,10 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SAMDetectorCombined": "SAMDetector (combined)",
     "SAMDetectorSegmented": "SAMDetector (segmented)",
     "FaceDetailerPipe": "FaceDetailer (pipe)",
+
+    "FromDetailerPipeSDXL": "FromDetailer (SDXL/pipe)",
+    "BasicPipeToDetailerPipeSDXL": "BasicPipe -> DetailerPipe (SDXL)",
+    "EditDetailerPipeSDXL": "Edit DetailerPipe (SDXL)",
 
     "BasicPipeToDetailerPipe": "BasicPipe -> DetailerPipe",
     "DetailerPipeToBasicPipe": "DetailerPipe -> BasicPipe",
@@ -260,11 +295,17 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ImageSender": "Image Sender",
     "ImageReceiver": "Image Receiver",
     "ImageMaskSwitch": "Switch (images, mask)",
-    "LatentSwitch": "Switch (latent)",
-    "SEGSSwitch": "Switch (SEGS)",
+    "ImpactSwitch": "Switch (Any)",
 
     "MasksToMaskList": "Masks to Mask List",
-    "ImpactImageBatchToImageList": "Image batch to Image List"
+    "ImpactImageBatchToImageList": "Image batch to Image List",
+    "ImpactMakeImageList": "Make Image List",
+    "ImpactStringSelector": "String Selector",
+
+    "RemoveNoiseMask": "Remove Noise Mask",
+
+    "LatentSwitch": "Switch (latent/legacy)",
+    "SEGSSwitch": "Switch (SEGS/legacy)"
 }
 
 if not impact.config.get_config()['mmdet_skip']:
@@ -300,4 +341,5 @@ try:
 except:
     pass
 
+WEB_DIRECTORY = "js"
 __all__ = ['NODE_CLASS_MAPPINGS', 'NODE_DISPLAY_NAME_MAPPINGS']

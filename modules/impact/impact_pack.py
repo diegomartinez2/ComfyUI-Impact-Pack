@@ -1,8 +1,6 @@
 import os
 import sys
 
-import torch
-
 import folder_paths
 import comfy.samplers
 import comfy.sd
@@ -13,12 +11,13 @@ import piexif
 import math
 import zipfile
 import re
-from PIL import ImageDraw
+
+import impact.wildcards
 from server import PromptServer
 
 from impact.utils import *
 import impact.core as core
-from impact.core import SEG, NO_BBOX_DETECTOR, NO_SEGM_DETECTOR
+from impact.core import SEG
 from impact.config import MAX_RESOLUTION, latent_letter_path
 from PIL import Image
 import numpy as np
@@ -26,7 +25,6 @@ import hashlib
 import json
 import safetensors.torch
 from PIL.PngImagePlugin import PngInfo
-import latent_preview
 import comfy.model_management
 
 warnings.filterwarnings('ignore', category=UserWarning, message='TypedStorage is deprecated')
@@ -75,13 +73,10 @@ class CLIPSegDetectorProvider:
     CATEGORY = "ImpactPack/Util"
 
     def doit(self, text, blur, threshold, dilation_factor):
-        try:
-            import custom_nodes.clipseg
+        if "CLIPSeg" in nodes.NODE_CLASS_MAPPINGS:
             return (core.BBoxDetectorBasedOnCLIPSeg(text, blur, threshold, dilation_factor), )
-        except Exception as e:
+        else:
             print("[ERROR] CLIPSegToBboxDetector: CLIPSeg custom node isn't installed. You must install biegert/ComfyUI-CLIPSeg extension to use this node.")
-            print(f"\t{e}")
-            pass
 
 
 class SAMLoader:
@@ -165,7 +160,11 @@ class SEGSDetailer:
                      "noise_mask": ("BOOLEAN", {"default": True, "label_on": "enabled", "label_off": "disabled"}),
                      "force_inpaint": ("BOOLEAN", {"default": False, "label_on": "enabled", "label_off": "disabled"}),
                      "basic_pipe": ("BASIC_PIPE",),
+                     "refiner_ratio": ("FLOAT", {"default": 0.2, "min": 0.0, "max": 1.0}),
                      },
+                "optional": {
+                     "refiner_basic_pipe_opt": ("BASIC_PIPE",),
+                    }
                 }
 
     RETURN_TYPES = ("SEGS", )
@@ -175,9 +174,13 @@ class SEGSDetailer:
 
     @staticmethod
     def do_detail(image, segs, guide_size, guide_size_for, max_size, seed, steps, cfg, sampler_name, scheduler,
-                  denoise, noise_mask, force_inpaint, basic_pipe):
+                  denoise, noise_mask, force_inpaint, basic_pipe, refiner_ratio=None, refiner_basic_pipe_opt=None):
 
         model, clip, vae, positive, negative = basic_pipe
+        if refiner_basic_pipe_opt is None:
+            refiner_model, refiner_clip, refiner_positive, refiner_negative = None, None, None, None
+        else:
+            refiner_model, refiner_clip, _, refiner_positive, refiner_negative = refiner_basic_pipe_opt
 
         new_segs = []
 
@@ -198,18 +201,26 @@ class SEGSDetailer:
 
             enhanced_pil = core.enhance_detail(cropped_image, model, clip, vae, guide_size, guide_size_for, max_size,
                                                seg.bbox, seed, steps, cfg, sampler_name, scheduler,
-                                               positive, negative, denoise, cropped_mask, force_inpaint)
+                                               positive, negative, denoise, cropped_mask, force_inpaint,
+                                               refiner_ratio=refiner_ratio, refiner_model=refiner_model,
+                                               refiner_clip=refiner_clip, refiner_positive=refiner_positive, refiner_negative=refiner_negative,
+                                               control_net_wrapper=seg.control_net_wrapper)
 
-            new_seg = SEG(enhanced_pil, seg.cropped_mask, seg.confidence, seg.crop_region, seg.bbox, seg.label)
+            if enhanced_pil is None:
+                new_cropped_image = cropped_image
+            else:
+                new_cropped_image = pil2numpy(enhanced_pil)
+
+            new_seg = SEG(new_cropped_image, seg.cropped_mask, seg.confidence, seg.crop_region, seg.bbox, seg.label, None)
             new_segs.append(new_seg)
 
         return segs[0], new_segs
 
     def doit(self, image, segs, guide_size, guide_size_for, max_size, seed, steps, cfg, sampler_name, scheduler,
-             denoise, noise_mask, force_inpaint, basic_pipe):
+             denoise, noise_mask, force_inpaint, basic_pipe, refiner_ratio=None, refiner_basic_pipe_opt=None):
 
-        segs = SEGSDetailer.do_detail(image, segs, guide_size, guide_size_for, max_size, seed, steps, cfg, sampler_name, scheduler,
-                                      denoise, noise_mask, force_inpaint, basic_pipe)
+        segs = SEGSDetailer.do_detail(image, segs, guide_size, guide_size_for, max_size, seed, steps, cfg, sampler_name,
+                                      scheduler, denoise, noise_mask, force_inpaint, basic_pipe, refiner_ratio, refiner_basic_pipe_opt)
 
         return (segs, )
 
@@ -237,7 +248,7 @@ class SEGSPaste:
         for seg in segs[1]:
             ref_image_pil = None
             if ref_image_opt is None and seg.cropped_image is not None:
-                ref_image_pil = seg.cropped_image
+                ref_image_pil = tensor2pil(torch.from_numpy(seg.cropped_image))
             elif ref_image_opt is not None:
                 cropped = crop_image(ref_image_opt, seg.crop_region)
                 cropped = np.clip(255. * cropped.squeeze(), 0, 255).astype(np.uint8)
@@ -281,14 +292,17 @@ class SEGSPreview:
         results = list()
 
         for seg in segs[1]:
+            cropped_image = None
+
             if seg.cropped_image is not None:
                 cropped_image = seg.cropped_image
             elif fallback_image_opt is not None:
                 # take from original image
                 cropped_image = crop_image(fallback_image_opt, seg.crop_region)
-                cropped_image = Image.fromarray(np.clip(255. * cropped_image.squeeze(), 0, 255).astype(np.uint8))
 
             if cropped_image is not None:
+                cropped_image = Image.fromarray(np.clip(255. * cropped_image.squeeze(), 0, 255).astype(np.uint8))
+
                 file = f"{filename}_{counter:05}_.webp"
                 cropped_image.save(os.path.join(full_output_folder, file))
                 results.append({
@@ -312,7 +326,8 @@ class SEGSLabelFilter:
                      },
                 }
 
-    RETURN_TYPES = ("SEGS",)
+    RETURN_TYPES = ("SEGS", "SEGS",)
+    RETURN_NAMES = ("filtered_SEGS", "remained_SEGS",)
     FUNCTION = "doit"
 
     CATEGORY = "ImpactPack/Util"
@@ -322,14 +337,18 @@ class SEGSLabelFilter:
         labels = set([label.strip() for label in labels])
 
         if 'all' in labels:
-            return (segs, )
+            return (segs, (segs[0], []), )
         else:
             res_segs = []
+            remained_segs = []
+
             for x in segs[1]:
                 if x.label in labels:
                     res_segs.append(x)
+                else:
+                    remained_segs.append(x)
 
-        return ((segs[0], res_segs), )
+        return ((segs[0], res_segs), (segs[0], remained_segs), )
 
 
 class SEGSOrderedFilter:
@@ -344,7 +363,8 @@ class SEGSOrderedFilter:
                      },
                 }
 
-    RETURN_TYPES = ("SEGS",)
+    RETURN_TYPES = ("SEGS", "SEGS",)
+    RETURN_NAMES = ("filtered_SEGS", "remained_SEGS",)
     FUNCTION = "doit"
 
     CATEGORY = "ImpactPack/Util"
@@ -380,8 +400,16 @@ class SEGSOrderedFilter:
         else:
             sorted_list = sorted(segs_with_order, key=lambda x: x[0], reverse=False)
 
-        result_list = [item[1] for item in sorted_list[take_start:take_start + take_count]]
-        return ((segs[0], result_list), )
+        result_list = []
+        remained_list = []
+
+        for i, item in enumerate(sorted_list):
+            if take_start <= i < take_start + take_count:
+                result_list.append(item[1])
+            else:
+                remained_list.append(item[1])
+
+        return ((segs[0], result_list), (segs[0], remained_list), )
 
 
 class SEGSRangeFilter:
@@ -396,13 +424,15 @@ class SEGSRangeFilter:
                      },
                 }
 
-    RETURN_TYPES = ("SEGS",)
+    RETURN_TYPES = ("SEGS", "SEGS",)
+    RETURN_NAMES = ("filtered_SEGS", "remained_SEGS",)
     FUNCTION = "doit"
 
     CATEGORY = "ImpactPack/Util"
 
     def doit(self, segs, target, mode, min_value, max_value):
         new_segs = []
+        remained_segs = []
 
         for seg in segs[1]:
             x1 = seg.crop_region[0]
@@ -432,9 +462,10 @@ class SEGSRangeFilter:
                 print(f"[out] value={value} / {mode}, {min_value}, {max_value}")
                 new_segs.append(seg)
             else:
+                remained_segs.append(seg)
                 print(f"[filter] value={value} / {mode}, {min_value}, {max_value}")
 
-        return ((segs[0], new_segs), )
+        return ((segs[0], new_segs), (segs[0], remained_segs), )
 
 
 class SEGSToImageList:
@@ -538,7 +569,9 @@ class DetailerForEach:
                      "feather": ("INT", {"default": 5, "min": 0, "max": 100, "step": 1}),
                      "noise_mask": ("BOOLEAN", {"default": True, "label_on": "enabled", "label_off": "disabled"}),
                      "force_inpaint": ("BOOLEAN", {"default": True, "label_on": "enabled", "label_off": "disabled"}),
+                     "wildcard": ("STRING", {"multiline": True, "dynamicPrompts": False}),
                      },
+                "optional": {"detailer_hook": ("DETAILER_HOOK",), }
                 }
 
     RETURN_TYPES = ("IMAGE", )
@@ -548,7 +581,8 @@ class DetailerForEach:
 
     @staticmethod
     def do_detail(image, segs, model, clip, vae, guide_size, guide_size_for_bbox, max_size, seed, steps, cfg, sampler_name, scheduler,
-                  positive, negative, denoise, feather, noise_mask, force_inpaint, wildcard_opt=None):
+                  positive, negative, denoise, feather, noise_mask, force_inpaint, wildcard_opt=None, detailer_hook=None,
+                  refiner_ratio=None, refiner_model=None, refiner_clip=None, refiner_positive=None, refiner_negative=None):
 
         image_pil = tensor2pil(image).convert('RGBA')
 
@@ -574,7 +608,10 @@ class DetailerForEach:
 
             enhanced_pil = core.enhance_detail(cropped_image, model, clip, vae, guide_size, guide_size_for_bbox, max_size,
                                                seg.bbox, seed, steps, cfg, sampler_name, scheduler,
-                                               positive, negative, denoise, cropped_mask, force_inpaint, wildcard_opt)
+                                               positive, negative, denoise, cropped_mask, force_inpaint, wildcard_opt, detailer_hook,
+                                               refiner_ratio=refiner_ratio, refiner_model=refiner_model,
+                                               refiner_clip=refiner_clip, refiner_positive=refiner_positive,
+                                               refiner_negative=refiner_negative, control_net_wrapper=seg.control_net_wrapper)
 
             if not (enhanced_pil is None):
                 # don't latent composite-> converting to latent caused poor quality
@@ -603,12 +640,12 @@ class DetailerForEach:
         return image_tensor, cropped_list, enhanced_list, enhanced_alpha_list
 
     def doit(self, image, segs, model, clip, vae, guide_size, guide_size_for, max_size, seed, steps, cfg, sampler_name,
-             scheduler, positive, negative, denoise, feather, noise_mask, force_inpaint):
+             scheduler, positive, negative, denoise, feather, noise_mask, force_inpaint, wildcard, detailer_hook=None):
 
         enhanced_img, cropped, cropped_enhanced, cropped_enhanced_alpha = \
             DetailerForEach.do_detail(image, segs, model, clip, vae, guide_size, guide_size_for, max_size, seed, steps,
                                       cfg, sampler_name, scheduler, positive, negative, denoise, feather, noise_mask,
-                                      force_inpaint)
+                                      force_inpaint, wildcard, detailer_hook)
 
         return (enhanced_img, )
 
@@ -631,8 +668,14 @@ class DetailerForEachPipe:
                      "feather": ("INT", {"default": 5, "min": 0, "max": 100, "step": 1}),
                      "noise_mask": ("BOOLEAN", {"default": True, "label_on": "enabled", "label_off": "disabled"}),
                      "force_inpaint": ("BOOLEAN", {"default": True, "label_on": "enabled", "label_off": "disabled"}),
-                     "basic_pipe": ("BASIC_PIPE", )
+                     "basic_pipe": ("BASIC_PIPE", ),
+                     "wildcard": ("STRING", {"multiline": True, "dynamicPrompts": False}),
+                     "refiner_ratio": ("FLOAT", {"default": 0.2, "min": 0.0, "max": 1.0}),
                      },
+                "optional": {
+                    "detailer_hook": ("DETAILER_HOOK",),
+                    "refiner_basic_pipe_opt": ("BASIC_PIPE",),
+                    }
                 }
 
     RETURN_TYPES = ("IMAGE", )
@@ -641,13 +684,21 @@ class DetailerForEachPipe:
     CATEGORY = "ImpactPack/Detailer"
 
     def doit(self, image, segs, guide_size, guide_size_for, max_size, seed, steps, cfg, sampler_name, scheduler,
-             denoise, feather, noise_mask, force_inpaint, basic_pipe):
+             denoise, feather, noise_mask, force_inpaint, basic_pipe, wildcard, refiner_ratio=None, detailer_hook=None, refiner_basic_pipe_opt=None):
 
         model, clip, vae, positive, negative = basic_pipe
+
+        if refiner_basic_pipe_opt is None:
+            refiner_model, refiner_clip, refiner_positive, refiner_negative = None, None, None, None
+        else:
+            refiner_model, refiner_clip, _, refiner_positive, refiner_negative = refiner_basic_pipe_opt
+
         enhanced_img, cropped, cropped_enhanced, cropped_enhanced_alpha = \
             DetailerForEach.do_detail(image, segs, model, clip, vae, guide_size, guide_size_for, max_size, seed, steps, cfg,
                                       sampler_name, scheduler, positive, negative, denoise, feather, noise_mask,
-                                      force_inpaint)
+                                      force_inpaint, wildcard, detailer_hook,
+                                      refiner_ratio=refiner_ratio, refiner_model=refiner_model,
+                                      refiner_clip=refiner_clip, refiner_positive=refiner_positive, refiner_negative=refiner_negative)
 
         return (enhanced_img, )
 
@@ -934,11 +985,12 @@ class FaceDetailer:
                      "drop_size": ("INT", {"min": 1, "max": MAX_RESOLUTION, "step": 1, "default": 10}),
 
                      "bbox_detector": ("BBOX_DETECTOR", ),
-                     "wildcard": ("STRING", {"multiline": True}),
+                     "wildcard": ("STRING", {"multiline": True, "dynamicPrompts": False}),
                      },
                 "optional": {
                     "sam_model_opt": ("SAM_MODEL", ),
                     "segm_detector_opt": ("SEGM_DETECTOR", ),
+                    "detailer_hook": ("DETAILER_HOOK",)
                 }}
 
     RETURN_TYPES = ("IMAGE", "IMAGE", "IMAGE", "MASK", "DETAILER_PIPE", )
@@ -954,7 +1006,9 @@ class FaceDetailer:
                      bbox_threshold, bbox_dilation, bbox_crop_factor,
                      sam_detection_hint, sam_dilation, sam_threshold, sam_bbox_expansion, sam_mask_hint_threshold,
                      sam_mask_hint_use_negative, drop_size,
-                     bbox_detector, segm_detector=None, sam_model_opt=None, wildcard_opt=None):
+                     bbox_detector, segm_detector=None, sam_model_opt=None, wildcard_opt=None, detailer_hook=None,
+                     refiner_ratio=None, refiner_model=None, refiner_clip=None, refiner_positive=None, refiner_negative=None):
+
         # make default prompt as 'face' if empty prompt for CLIPSeg
         bbox_detector.setAux('face')
         segs = bbox_detector.detect(image, bbox_threshold, bbox_dilation, bbox_crop_factor, drop_size)
@@ -975,7 +1029,10 @@ class FaceDetailer:
         enhanced_img, _, cropped_enhanced, cropped_enhanced_alpha = \
             DetailerForEach.do_detail(image, segs, model, clip, vae, guide_size, guide_size_for_bbox, max_size, seed, steps, cfg,
                                       sampler_name, scheduler, positive, negative, denoise, feather, noise_mask,
-                                      force_inpaint, wildcard_opt)
+                                      force_inpaint, wildcard_opt, detailer_hook,
+                                      refiner_ratio=refiner_ratio, refiner_model=refiner_model,
+                                      refiner_clip=refiner_clip, refiner_positive=refiner_positive,
+                                      refiner_negative=refiner_negative)
 
         # Mask Generator
         mask = core.segs_to_combined_mask(segs)
@@ -992,16 +1049,16 @@ class FaceDetailer:
              positive, negative, denoise, feather, noise_mask, force_inpaint,
              bbox_threshold, bbox_dilation, bbox_crop_factor,
              sam_detection_hint, sam_dilation, sam_threshold, sam_bbox_expansion, sam_mask_hint_threshold,
-             sam_mask_hint_use_negative, drop_size, bbox_detector, wildcard, sam_model_opt=None, segm_detector_opt=None):
+             sam_mask_hint_use_negative, drop_size, bbox_detector, wildcard, sam_model_opt=None, segm_detector_opt=None, detailer_hook=None):
 
         enhanced_img, cropped_enhanced, cropped_enhanced_alpha, mask = FaceDetailer.enhance_face(
             image, model, clip, vae, guide_size, guide_size_for, max_size, seed, steps, cfg, sampler_name, scheduler,
             positive, negative, denoise, feather, noise_mask, force_inpaint,
             bbox_threshold, bbox_dilation, bbox_crop_factor,
             sam_detection_hint, sam_dilation, sam_threshold, sam_bbox_expansion, sam_mask_hint_threshold,
-            sam_mask_hint_use_negative, drop_size, bbox_detector, segm_detector_opt, sam_model_opt, wildcard)
+            sam_mask_hint_use_negative, drop_size, bbox_detector, segm_detector_opt, sam_model_opt, wildcard, detailer_hook)
 
-        pipe = (model, clip, vae, positive, negative, wildcard, bbox_detector, segm_detector_opt, sam_model_opt)
+        pipe = (model, clip, vae, positive, negative, wildcard, bbox_detector, segm_detector_opt, sam_model_opt, detailer_hook, None, None, None, None)
         return enhanced_img, cropped_enhanced, cropped_enhanced_alpha, mask, pipe
 
 
@@ -1035,6 +1092,34 @@ class LatentPixelScale:
         return (latent,)
 
 
+class NoiseInjectionDetailerHookProvider:
+    schedules = ["simple"]
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+                     "source": (["CPU", "GPU"],),
+                     "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
+                     "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 200.0, "step": 0.01}),
+                    },
+                }
+
+    RETURN_TYPES = ("DETAILER_HOOK",)
+    FUNCTION = "doit"
+
+    CATEGORY = "ImpactPack/Detailer"
+
+    def doit(self, source, seed, strength):
+        try:
+            hook = core.InjectNoiseHook(source, seed, strength, strength)
+            hook.set_steps((1, 1))
+            return (hook, )
+        except Exception as e:
+            print("[ERROR] NoiseInjectionDetailerHookProvider: 'ComfyUI Noise' custom node isn't installed. You must install 'BlenderNeko/ComfyUI Noise' extension to use this node.")
+            print(f"\t{e}")
+            pass
+
+
 class CfgScheduleHookProvider:
     schedules = ["simple"]
 
@@ -1057,6 +1142,38 @@ class CfgScheduleHookProvider:
             hook = core.SimpleCfgScheduleHook(target_cfg)
 
         return (hook, )
+
+
+class NoiseInjectionHookProvider:
+    schedules = ["simple"]
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+                     "schedule_for_iteration": (s.schedules,),
+                     "source": (["CPU", "GPU"],),
+                     "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
+                     "start_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 200.0, "step": 0.01}),
+                     "end_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 200.0, "step": 0.01}),
+                    },
+                }
+
+    RETURN_TYPES = ("PK_HOOK",)
+    FUNCTION = "doit"
+
+    CATEGORY = "ImpactPack/Upscale"
+
+    def doit(self, schedule_for_iteration, source, seed, start_strength, end_strength):
+        try:
+            hook = None
+            if schedule_for_iteration == "simple":
+                hook = core.InjectNoiseHook(source, seed, start_strength, end_strength)
+
+            return (hook, )
+        except Exception as e:
+            print("[ERROR] NoiseInjectionHookProvider: 'ComfyUI Noise' custom node isn't installed. You must install 'BlenderNeko/ComfyUI Noise' extension to use this node.")
+            print(f"\t{e}")
+            pass
 
 
 class DenoiseScheduleHookProvider:
@@ -1112,8 +1229,8 @@ class TiledKSamplerProvider:
                     "sampler_name": (comfy.samplers.KSampler.SAMPLERS, ),
                     "scheduler": (comfy.samplers.KSampler.SCHEDULERS, ),
                     "denoise": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
-                    "tile_width": ("INT", {"default": 512, "min": 256, "max": MAX_RESOLUTION, "step": 64}),
-                    "tile_height": ("INT", {"default": 512, "min": 256, "max": MAX_RESOLUTION, "step": 64}),
+                    "tile_width": ("INT", {"default": 512, "min": 320, "max": MAX_RESOLUTION, "step": 64}),
+                    "tile_height": ("INT", {"default": 512, "min": 320, "max": MAX_RESOLUTION, "step": 64}),
                     "tiling_strategy": (["random", "padded", 'simple'], ),
                     "basic_pipe": ("BASIC_PIPE", )
                     }}
@@ -1148,8 +1265,8 @@ class PixelTiledKSampleUpscalerProvider:
                     "positive": ("CONDITIONING", ),
                     "negative": ("CONDITIONING", ),
                     "denoise": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
-                    "tile_width": ("INT", {"default": 512, "min": 256, "max": MAX_RESOLUTION, "step": 64}),
-                    "tile_height": ("INT", {"default": 512, "min": 256, "max": MAX_RESOLUTION, "step": 64}),
+                    "tile_width": ("INT", {"default": 512, "min": 320, "max": MAX_RESOLUTION, "step": 64}),
+                    "tile_height": ("INT", {"default": 512, "min": 320, "max": MAX_RESOLUTION, "step": 64}),
                     "tiling_strategy": (["random", "padded", 'simple'], ),
                     },
                 "optional": {
@@ -1164,14 +1281,11 @@ class PixelTiledKSampleUpscalerProvider:
     CATEGORY = "ImpactPack/Upscale"
 
     def doit(self, scale_method, model, vae, seed, steps, cfg, sampler_name, scheduler, positive, negative, denoise, tile_width, tile_height, tiling_strategy, upscale_model_opt=None, pk_hook_opt=None):
-        try:
-            import custom_nodes.ComfyUI_TiledKSampler.nodes
-            upscaler = core.PixelTiledKSampleUpscaler(scale_method, model, vae, seed, steps, cfg, sampler_name, scheduler, positive, negative, denoise, tile_width, tile_height, tiling_strategy, upscale_model_opt, pk_hook_opt)
+        if "BNK_TiledKSampler" in nodes.NODE_CLASS_MAPPINGS:
+            upscaler = core.PixelTiledKSampleUpscaler(scale_method, model, vae, seed, steps, cfg, sampler_name, scheduler, positive, negative, denoise, tile_width, tile_height, tiling_strategy, upscale_model_opt, pk_hook_opt, tile_size=max(tile_width, tile_height))
             return (upscaler, )
-        except Exception as e:
+        else:
             print("[ERROR] PixelTiledKSampleUpscalerProvider: ComfyUI_TiledKSampler custom node isn't installed. You must install BlenderNeko/ComfyUI_TiledKSampler extension to use this node.")
-            print(f"\t{e}")
-            pass
 
 
 class PixelTiledKSampleUpscalerProviderPipe:
@@ -1187,8 +1301,8 @@ class PixelTiledKSampleUpscalerProviderPipe:
                     "sampler_name": (comfy.samplers.KSampler.SAMPLERS, ),
                     "scheduler": (comfy.samplers.KSampler.SCHEDULERS, ),
                     "denoise": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
-                    "tile_width": ("INT", {"default": 512, "min": 256, "max": MAX_RESOLUTION, "step": 64}),
-                    "tile_height": ("INT", {"default": 512, "min": 256, "max": MAX_RESOLUTION, "step": 64}),
+                    "tile_width": ("INT", {"default": 512, "min": 320, "max": MAX_RESOLUTION, "step": 64}),
+                    "tile_height": ("INT", {"default": 512, "min": 320, "max": MAX_RESOLUTION, "step": 64}),
                     "tiling_strategy": (["random", "padded", 'simple'], ),
                     "basic_pipe": ("BASIC_PIPE",)
                     },
@@ -1204,15 +1318,12 @@ class PixelTiledKSampleUpscalerProviderPipe:
     CATEGORY = "ImpactPack/Upscale"
 
     def doit(self, scale_method, seed, steps, cfg, sampler_name, scheduler, denoise, tile_width, tile_height, tiling_strategy, basic_pipe, upscale_model_opt=None, pk_hook_opt=None):
-        try:
-            import custom_nodes.ComfyUI_TiledKSampler.nodes
+        if "BNK_TiledKSampler" in nodes.NODE_CLASS_MAPPINGS:
             model, _, vae, positive, negative = basic_pipe
-            upscaler = core.PixelTiledKSampleUpscaler(scale_method, model, vae, seed, steps, cfg, sampler_name, scheduler, positive, negative, denoise, tile_width, tile_height, tiling_strategy, upscale_model_opt, pk_hook_opt)
+            upscaler = core.PixelTiledKSampleUpscaler(scale_method, model, vae, seed, steps, cfg, sampler_name, scheduler, positive, negative, denoise, tile_width, tile_height, tiling_strategy, upscale_model_opt, pk_hook_opt, tile_size=max(tile_width, tile_height))
             return (upscaler, )
-        except Exception as e:
+        else:
             print("[ERROR] PixelTiledKSampleUpscalerProviderPipe: ComfyUI_TiledKSampler custom node isn't installed. You must install BlenderNeko/ComfyUI_TiledKSampler extension to use this node.")
-            print(f"\t{e}")
-            pass
 
 
 class PixelKSampleUpscalerProvider:
@@ -1233,6 +1344,7 @@ class PixelKSampleUpscalerProvider:
                     "negative": ("CONDITIONING", ),
                     "denoise": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
                     "use_tiled_vae": ("BOOLEAN", {"default": False, "label_on": "enabled", "label_off": "disabled"}),
+                    "tile_size": ("INT", {"default": 512, "min": 320, "max": 4096, "step": 64}),
                     },
                 "optional": {
                         "upscale_model_opt": ("UPSCALE_MODEL", ),
@@ -1246,9 +1358,10 @@ class PixelKSampleUpscalerProvider:
     CATEGORY = "ImpactPack/Upscale"
 
     def doit(self, scale_method, model, vae, seed, steps, cfg, sampler_name, scheduler, positive, negative, denoise,
-             use_tiled_vae, upscale_model_opt=None, pk_hook_opt=None):
+             use_tiled_vae, upscale_model_opt=None, pk_hook_opt=None, tile_size=512):
         upscaler = core.PixelKSampleUpscaler(scale_method, model, vae, seed, steps, cfg, sampler_name, scheduler,
-                                             positive, negative, denoise, use_tiled_vae, upscale_model_opt, pk_hook_opt)
+                                             positive, negative, denoise, use_tiled_vae, upscale_model_opt, pk_hook_opt,
+                                             tile_size=tile_size)
         return (upscaler, )
 
 
@@ -1266,7 +1379,8 @@ class PixelKSampleUpscalerProviderPipe(PixelKSampleUpscalerProvider):
                     "scheduler": (comfy.samplers.KSampler.SCHEDULERS, ),
                     "denoise": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
                     "use_tiled_vae": ("BOOLEAN", {"default": False, "label_on": "enabled", "label_off": "disabled"}),
-                    "basic_pipe": ("BASIC_PIPE",)
+                    "basic_pipe": ("BASIC_PIPE",),
+                    "tile_size": ("INT", {"default": 512, "min": 320, "max": 4096, "step": 64}),
                     },
                 "optional": {
                         "upscale_model_opt": ("UPSCALE_MODEL", ),
@@ -1280,10 +1394,11 @@ class PixelKSampleUpscalerProviderPipe(PixelKSampleUpscalerProvider):
     CATEGORY = "ImpactPack/Upscale"
 
     def doit_pipe(self, scale_method, seed, steps, cfg, sampler_name, scheduler, denoise,
-                  use_tiled_vae, basic_pipe, upscale_model_opt=None, pk_hook_opt=None):
+                  use_tiled_vae, basic_pipe, upscale_model_opt=None, pk_hook_opt=None, tile_size=512):
         model, _, vae, positive, negative = basic_pipe
         upscaler = core.PixelKSampleUpscaler(scale_method, model, vae, seed, steps, cfg, sampler_name, scheduler,
-                                             positive, negative, denoise, use_tiled_vae, upscale_model_opt, pk_hook_opt)
+                                             positive, negative, denoise, use_tiled_vae, upscale_model_opt, pk_hook_opt,
+                                             tile_size=tile_size)
         return (upscaler, )
 
 
@@ -1304,6 +1419,7 @@ class TwoSamplersForMaskUpscalerProvider:
                      "mask_sampler": ("KSAMPLER", ),
                      "mask": ("MASK", ),
                      "vae": ("VAE",),
+                     "tile_size": ("INT", {"default": 512, "min": 320, "max": 4096, "step": 64}),
                      },
                 "optional": {
                         "full_sampler_opt": ("KSAMPLER",),
@@ -1321,10 +1437,10 @@ class TwoSamplersForMaskUpscalerProvider:
 
     def doit(self, scale_method, full_sample_schedule, use_tiled_vae, base_sampler, mask_sampler, mask, vae,
              full_sampler_opt=None, upscale_model_opt=None,
-             pk_hook_base_opt=None, pk_hook_mask_opt=None, pk_hook_full_opt=None):
+             pk_hook_base_opt=None, pk_hook_mask_opt=None, pk_hook_full_opt=None, tile_size=512):
         upscaler = core.TwoSamplersForMaskUpscaler(scale_method, full_sample_schedule, use_tiled_vae,
                                                    base_sampler, mask_sampler, mask, vae, full_sampler_opt, upscale_model_opt,
-                                                   pk_hook_base_opt, pk_hook_mask_opt, pk_hook_full_opt)
+                                                   pk_hook_base_opt, pk_hook_mask_opt, pk_hook_full_opt, tile_size=tile_size)
         return (upscaler, )
 
 
@@ -1345,6 +1461,7 @@ class TwoSamplersForMaskUpscalerProviderPipe:
                      "mask_sampler": ("KSAMPLER", ),
                      "mask": ("MASK", ),
                      "basic_pipe": ("BASIC_PIPE",),
+                     "tile_size": ("INT", {"default": 512, "min": 320, "max": 4096, "step": 64}),
                      },
                 "optional": {
                         "full_sampler_opt": ("KSAMPLER",),
@@ -1362,11 +1479,11 @@ class TwoSamplersForMaskUpscalerProviderPipe:
 
     def doit(self, scale_method, full_sample_schedule, use_tiled_vae, base_sampler, mask_sampler, mask, basic_pipe,
              full_sampler_opt=None, upscale_model_opt=None,
-             pk_hook_base_opt=None, pk_hook_mask_opt=None, pk_hook_full_opt=None):
+             pk_hook_base_opt=None, pk_hook_mask_opt=None, pk_hook_full_opt=None, tile_size=512):
         _, _, vae, _, _ = basic_pipe
         upscaler = core.TwoSamplersForMaskUpscaler(scale_method, full_sample_schedule, use_tiled_vae,
                                                    base_sampler, mask_sampler, mask, vae, full_sampler_opt, upscale_model_opt,
-                                                   pk_hook_base_opt, pk_hook_mask_opt, pk_hook_full_opt)
+                                                   pk_hook_base_opt, pk_hook_mask_opt, pk_hook_full_opt, tile_size=tile_size)
         return (upscaler, )
 
 
@@ -1448,7 +1565,7 @@ class IterativeImageUpscale:
 
         core.update_node_status(unique_id, "VAEEncode (first)", 0)
         if upscaler.is_tiled:
-            latent = nodes.VAEEncodeTiled().encode(vae, pixels)[0]
+            latent = nodes.VAEEncodeTiled().encode(vae, pixels, upscaler.tile_size)[0]
         else:
             latent = nodes.VAEEncode().encode(vae, pixels)[0]
 
@@ -1456,7 +1573,7 @@ class IterativeImageUpscale:
 
         core.update_node_status(unique_id, "VAEDecode (final)", 1.0)
         if upscaler.is_tiled:
-            pixels = nodes.VAEDecodeTiled().decode(vae, refined_latent[0])[0]
+            pixels = nodes.VAEDecodeTiled().decode(vae, refined_latent[0], upscaler.tile_size)[0]
         else:
             pixels = nodes.VAEDecode().decode(vae, refined_latent[0])[0]
 
@@ -1496,6 +1613,7 @@ class FaceDetailerPipe:
                      "sam_mask_hint_use_negative": (["False", "Small", "Outter"],),
 
                      "drop_size": ("INT", {"min": 1, "max": MAX_RESOLUTION, "step": 1, "default": 10}),
+                     "refiner_ratio": ("FLOAT", {"default": 0.2, "min": 0.0, "max": 1.0}),
                      },
                 }
 
@@ -1509,16 +1627,19 @@ class FaceDetailerPipe:
     def doit(self, image, detailer_pipe, guide_size, guide_size_for, max_size, seed, steps, cfg, sampler_name, scheduler,
              denoise, feather, noise_mask, force_inpaint, bbox_threshold, bbox_dilation, bbox_crop_factor,
              sam_detection_hint, sam_dilation, sam_threshold, sam_bbox_expansion,
-             sam_mask_hint_threshold, sam_mask_hint_use_negative, drop_size):
+             sam_mask_hint_threshold, sam_mask_hint_use_negative, drop_size, refiner_ratio=None):
 
-        model, clip, vae, positive, negative, wildcard, bbox_detector, segm_detector, sam_model_opt = detailer_pipe
+        model, clip, vae, positive, negative, wildcard, bbox_detector, segm_detector, sam_model_opt, detailer_hook, \
+            refiner_model, refiner_clip, refiner_positive, refiner_negative = detailer_pipe
 
         enhanced_img, cropped_enhanced, cropped_enhanced_alpha, mask = FaceDetailer.enhance_face(
             image, model, clip, vae, guide_size, guide_size_for, max_size, seed, steps, cfg, sampler_name, scheduler,
             positive, negative, denoise, feather, noise_mask, force_inpaint,
             bbox_threshold, bbox_dilation, bbox_crop_factor,
             sam_detection_hint, sam_dilation, sam_threshold, sam_bbox_expansion, sam_mask_hint_threshold,
-            sam_mask_hint_use_negative, drop_size, bbox_detector, segm_detector, sam_model_opt, wildcard)
+            sam_mask_hint_use_negative, drop_size, bbox_detector, segm_detector, sam_model_opt, wildcard, detailer_hook,
+            refiner_ratio=refiner_ratio, refiner_model=refiner_model,
+            refiner_clip=refiner_clip, refiner_positive=refiner_positive, refiner_negative=refiner_negative)
 
         if len(cropped_enhanced) == 0:
             cropped_enhanced = [empty_pil_tensor()]
@@ -1539,12 +1660,12 @@ class DetailerForEachTest(DetailerForEach):
     CATEGORY = "ImpactPack/Detailer"
 
     def doit(self, image, segs, model, clip, vae, guide_size, guide_size_for, max_size, seed, steps, cfg, sampler_name,
-             scheduler, positive, negative, denoise, feather, noise_mask, force_inpaint):
+             scheduler, positive, negative, denoise, feather, noise_mask, force_inpaint, wildcard, detailer_hook=None):
 
         enhanced_img, cropped, cropped_enhanced, cropped_enhanced_alpha = \
             DetailerForEach.do_detail(image, segs, model, clip, vae, guide_size, guide_size_for, max_size, seed, steps,
                                       cfg, sampler_name, scheduler, positive, negative, denoise, feather, noise_mask,
-                                      force_inpaint)
+                                      force_inpaint, wildcard, detailer_hook)
 
         # set fallback image
         if len(cropped) == 0:
@@ -1569,13 +1690,22 @@ class DetailerForEachTestPipe(DetailerForEachPipe):
     CATEGORY = "ImpactPack/Detailer"
 
     def doit(self, image, segs, guide_size, guide_size_for, max_size, seed, steps, cfg, sampler_name, scheduler,
-             denoise, feather, noise_mask, force_inpaint, basic_pipe):
+             denoise, feather, noise_mask, force_inpaint, basic_pipe, wildcard, refiner_ratio=None, detailer_hook=None, refiner_basic_pipe_opt=None):
 
         model, clip, vae, positive, negative = basic_pipe
+
+        if refiner_basic_pipe_opt is None:
+            refiner_model, refiner_clip, refiner_positive, refiner_negative = None, None, None, None
+        else:
+            refiner_model, refiner_clip, _, refiner_positive, refiner_negative = refiner_basic_pipe_opt
+
         enhanced_img, cropped, cropped_enhanced, cropped_enhanced_alpha = \
             DetailerForEach.do_detail(image, segs, model, clip, vae, guide_size, guide_size_for, max_size, seed, steps, cfg,
                                       sampler_name, scheduler, positive, negative, denoise, feather, noise_mask,
-                                      force_inpaint)
+                                      force_inpaint, wildcard, detailer_hook,
+                                      refiner_ratio=refiner_ratio, refiner_model=refiner_model,
+                                      refiner_clip=refiner_clip, refiner_positive=refiner_positive,
+                                      refiner_negative=refiner_negative)
 
         # set fallback image
         if len(cropped) == 0:
@@ -1706,7 +1836,7 @@ class BitwiseAndMaskForEach:
                             cropped_mask1[j - crop_region1[1], i - crop_region1[0]] = 0
 
                 if overlapped:
-                    item = SEG(bseg.cropped_image, cropped_mask1, bseg.confidence, bseg.crop_region, bseg.bbox, bseg.label)
+                    item = SEG(bseg.cropped_image, cropped_mask1, bseg.confidence, bseg.crop_region, bseg.bbox, bseg.label, None)
                     result.append(item)
 
         return ((base_segs[0], result),)
@@ -1759,7 +1889,7 @@ class SubtractMaskForEach:
                             pass
 
                 if changed:
-                    item = SEG(bseg.cropped_image, cropped_mask1, bseg.confidence, bseg.crop_region, bseg.bbox, bseg.label)
+                    item = SEG(bseg.cropped_image, cropped_mask1, bseg.confidence, bseg.crop_region, bseg.bbox, bseg.label, None)
                     result.append(item)
                 else:
                     result.append(base_segs)
@@ -2134,9 +2264,11 @@ class LatentSender(nodes.SaveLatent):
     @classmethod
     def INPUT_TYPES(s):
         return {"required": {
-                    "samples": ("LATENT", ),
-                    "filename_prefix": ("STRING", {"default": "latents/LatentSender"}),
-                    "link_id": ("INT", {"default": 0, "min": 0, "max": sys.maxsize, "step": 1}), },
+                             "samples": ("LATENT", ),
+                             "filename_prefix": ("STRING", {"default": "latents/LatentSender"}),
+                             "link_id": ("INT", {"default": 0, "min": 0, "max": sys.maxsize, "step": 1}),
+                             "preview_method": (["Latent2RGB-SDXL", "Latent2RGB-SD15", "TAESDXL", "TAESD15"],)
+                             },
                 "hidden": {"prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO"},
                 }
 
@@ -2167,11 +2299,28 @@ class LatentSender(nodes.SaveLatent):
         image.save(image_path, format='png', exif=exif_bytes, pnginfo=metadata, optimize=True)
 
     @staticmethod
-    def prepare_preview(latent_tensor):
+    def prepare_preview(latent_tensor, preview_method):
+        from comfy.cli_args import LatentPreviewMethod
+        import comfy.latent_formats as latent_formats
+
         lower_bound = 128
         upper_bound = 256
 
-        previewer = core.get_previewer("cpu", force=True)
+        if preview_method == "Latent2RGB-SD15":
+            latent_format = latent_formats.SD15()
+            method = LatentPreviewMethod.Latent2RGB
+        elif preview_method == "TAESD15":
+            latent_format = latent_formats.SD15()
+            method = LatentPreviewMethod.TAESD
+        elif preview_method == "TAESDXL":
+            latent_format = latent_formats.SDXL()
+            method = LatentPreviewMethod.TAESD
+        else:  # preview_method == "Latent2RGB-SDXL"
+            latent_format = latent_formats.SDXL()
+            method = LatentPreviewMethod.Latent2RGB
+
+        previewer = core.get_previewer("cpu", latent_format=latent_format, force=True, method=method)
+
         image = previewer.decode_latent_to_preview(latent_tensor)
         min_size = min(image.size[0], image.size[1])
         max_size = max(image.size[0], image.size[1])
@@ -2211,11 +2360,11 @@ class LatentSender(nodes.SaveLatent):
 
         return new_image
 
-    def doit(self, samples, filename_prefix="latents/LatentSender", link_id=0, prompt=None, extra_pnginfo=None):
+    def doit(self, samples, filename_prefix="latents/LatentSender", link_id=0, preview_method="Latent2RGB-SDXL", prompt=None, extra_pnginfo=None):
         full_output_folder, filename, counter, subfolder, filename_prefix = folder_paths.get_save_image_path(filename_prefix, self.output_dir)
 
         # load preview
-        preview = LatentSender.prepare_preview(samples['samples'])
+        preview = LatentSender.prepare_preview(samples['samples'], preview_method)
 
         # support save metadata for latent sharing
         file = f"{filename}_{counter:05}_.latent.png"
@@ -2279,14 +2428,8 @@ class LatentSwitch:
     @classmethod
     def INPUT_TYPES(s):
         return {"required": {
-                    "select": ("INT", {"default": 1, "min": 1, "max": 4, "step": 1}),
+                    "select": ("INT", {"default": 1, "min": 1, "max": 99999, "step": 1}),
                     "latent1": ("LATENT",),
-                    },
-
-                "optional": {
-                        "latent2_opt": ("LATENT",),
-                        "latent3_opt": ("LATENT",),
-                        "latent4_opt": ("LATENT",),
                     },
                 }
 
@@ -2298,29 +2441,22 @@ class LatentSwitch:
 
     CATEGORY = "ImpactPack/Util"
 
-    def doit(self, select, latent1, latent2_opt=None, latent3_opt=None, latent4_opt=None):
-        if select == 1:
-            return (latent1,)
-        elif select == 2:
-            return (latent2_opt,)
-        elif select == 3:
-            return (latent3_opt,)
+    def doit(self, *args, **kwargs):
+        input_name = f"latent{int(kwargs['select'])}"
+
+        if input_name in kwargs:
+            return (kwargs[input_name],)
         else:
-            return (latent4_opt,)
+            print(f"LatentSwitch: invalid select index ('latent1' is selected)")
+            return (kwargs['latent1'],)
 
 
 class SEGSSwitch:
     @classmethod
     def INPUT_TYPES(s):
         return {"required": {
-                    "select": ("INT", {"default": 1, "min": 1, "max": 4, "step": 1}),
-                    "segs": ("SEGS",),
-                    },
-
-                "optional": {
-                        "segs2_opt": ("SEGS",),
-                        "segs3_opt": ("SEGS",),
-                        "segs4_opt": ("SEGS",),
+                    "select": ("INT", {"default": 1, "min": 1, "max": 99999, "step": 1}),
+                    "segs1": ("SEGS",),
                     },
                 }
 
@@ -2332,43 +2468,14 @@ class SEGSSwitch:
 
     CATEGORY = "ImpactPack/Util"
 
-    def doit(self, select, segs, segs2_opt=None, segs3_opt=None, segs4_opt=None):
-        if select == 1:
-            return (segs,)
-        elif select == 2:
-            return (segs2_opt,)
-        elif select == 3:
-            return (segs3_opt,)
+    def doit(self, *args, **kwargs):
+        input_name = f"segs{int(kwargs['select'])}"
+
+        if input_name in kwargs:
+            return (kwargs[input_name],)
         else:
-            return (segs4_opt,)
-
-
-# class SEGPick:
-#     @classmethod
-#     def INPUT_TYPES(s):
-#         return {"required": {
-#                     "select": ("INT", {"default": 1, "min": 1, "max": 99999, "step": 1}),
-#                     "segs": ("SEGS",),
-#                     },
-#                 }
-#
-#     RETURN_TYPES = ("SEGS", )
-#
-#     OUTPUT_NODE = True
-#
-#     FUNCTION = "doit"
-#
-#     CATEGORY = "ImpactPack/Util"
-#
-#     def doit(self, select, segs):
-#         if select == 1:
-#             return (segs,)
-#         elif select == 2:
-#             return (segs2_opt,)
-#         elif select == 3:
-#             return (segs3_opt,)
-#         else:
-#             return (segs4_opt,)
+            print(f"SEGSSwitch: invalid select index ('segs1' is selected)")
+            return (kwargs['segs1'],)
 
 
 class SaveConditioning:
@@ -2454,9 +2561,10 @@ class ImpactWildcardProcessor:
     @classmethod
     def INPUT_TYPES(s):
         return {"required": {
-                        "wildcard_text": ("STRING", {"multiline": True}),
-                        "populated_text": ("STRING", {"multiline": True}),
+                        "wildcard_text": ("STRING", {"multiline": True, "dynamicPrompts": False}),
+                        "populated_text": ("STRING", {"multiline": True, "dynamicPrompts": False}),
                         "mode": ("BOOLEAN", {"default": True, "label_on": "Populate", "label_off": "Fixed"}),
+                        "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
                     },
                 }
 
@@ -2465,8 +2573,34 @@ class ImpactWildcardProcessor:
     RETURN_TYPES = ("STRING", )
     FUNCTION = "doit"
 
-    def doit(self, wildcard_text, populated_text, mode):
+    def doit(self, wildcard_text, populated_text, mode, seed):
         return (populated_text, )
+
+
+class ImpactWildcardEncode:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+                        "model": ("MODEL",),
+                        "clip": ("CLIP",),
+                        "wildcard_text": ("STRING", {"multiline": True, "dynamicPrompts": False}),
+                        "populated_text": ("STRING", {"multiline": True, "dynamicPrompts": False}),
+                        "mode": ("BOOLEAN", {"default": True, "label_on": "Populate", "label_off": "Fixed"}),
+                        "Select to add LoRA": (["Select the LoRA to add to the text"] + folder_paths.get_filename_list("loras"), ),
+                        "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
+                    },
+                }
+
+    CATEGORY = "ImpactPack/Prompt"
+
+    RETURN_TYPES = ("MODEL", "CLIP", "CONDITIONING", "STRING")
+    RETURN_NAMES = ("model", "clip", "conditioning", "populated_text")
+    FUNCTION = "doit"
+
+    def doit(self, *args, **kwargs):
+        populated = kwargs['populated_text']
+        model, clip, conditioning = impact.wildcards.process_with_loras(populated, kwargs['model'], kwargs['clip'])
+        return (model, clip, conditioning, populated)
 
 
 class ReencodeLatent:
@@ -2477,6 +2611,7 @@ class ReencodeLatent:
                         "tile_mode": (["None", "Both", "Decode(input) only", "Encode(output) only"],),
                         "input_vae": ("VAE", ),
                         "output_vae": ("VAE", ),
+                        "tile_size": ("INT", {"default": 512, "min": 320, "max": 4096, "step": 64}),
                     },
                 }
 
@@ -2485,14 +2620,14 @@ class ReencodeLatent:
     RETURN_TYPES = ("LATENT", )
     FUNCTION = "doit"
 
-    def doit(self, samples, tile_mode, input_vae, output_vae):
+    def doit(self, samples, tile_mode, input_vae, output_vae, tile_size=512):
         if tile_mode in ["Both", "Decode(input) only"]:
-            pixels = nodes.VAEDecodeTiled().decode(input_vae, samples)[0]
+            pixels = nodes.VAEDecodeTiled().decode(input_vae, samples, tile_size)[0]
         else:
             pixels = nodes.VAEDecode().decode(input_vae, samples)[0]
 
         if tile_mode in ["Both", "Encode(output) only"]:
-            return nodes.VAEEncodeTiled().encode(output_vae, pixels)
+            return nodes.VAEEncodeTiled().encode(output_vae, pixels, tile_size)
         else:
             return nodes.VAEEncode().encode(output_vae, pixels)
 
@@ -2585,38 +2720,6 @@ class KSamplerAdvancedBasicPipe:
         return (basic_pipe, latent, vae)
 
 
-class ImpactLogger:
-    @classmethod
-    def INPUT_TYPES(s):
-        return {"required": {
-                        "text": ("STRING", {"default": "", "forceInput": True}),
-                    },
-                "hidden": {"prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO"},
-                }
-
-    CATEGORY = "ImpactPack/Debug"
-
-    OUTPUT_NODE = True
-
-    RETURN_TYPES = ()
-    FUNCTION = "doit"
-
-    def doit(self, text, prompt, extra_pnginfo):
-        print(f"[IMPACT LOGGER]: {text}")
-
-        print(f"         PROMPT: {prompt}")
-
-        # for x in prompt:
-        #     if 'inputs' in x and 'populated_text' in x['inputs']:
-        #         print(f"PROMP: {x['10']['inputs']['populated_text']}")
-        #
-        # for x in extra_pnginfo['workflow']['nodes']:
-        #     if x['type'] == 'ImpactWildcardProcessor':
-        #         print(f" WV : {x['widgets_values'][1]}\n")
-
-        return {}
-
-
 class ImageBatchToImageList:
     @classmethod
     def INPUT_TYPES(s):
@@ -2631,3 +2734,152 @@ class ImageBatchToImageList:
     def doit(self, image):
         images = [image[i:i + 1, ...] for i in range(image.shape[0])]
         return (images, )
+
+
+class MakeImageList:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {"image1": ("IMAGE",), }}
+
+    RETURN_TYPES = ("IMAGE",)
+    OUTPUT_IS_LIST = (True,)
+    FUNCTION = "doit"
+
+    CATEGORY = "ImpactPack/Util"
+
+    def doit(self, **kwargs):
+        images = []
+
+        for k, v in kwargs.items():
+            images.append(v)
+
+        return (images, )
+
+
+class ControlNetApplySEGS:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+                    "segs": ("SEGS",),
+                    "control_net": ("CONTROL_NET",),
+                    "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.01}),
+                    },
+                "optional": {
+                    "segs_preprocessor": ("SEGS_PREPROCESSOR",),
+                    }
+                }
+
+    RETURN_TYPES = ("SEGS",)
+    FUNCTION = "doit"
+
+    CATEGORY = "ImpactPack/Util"
+
+    def doit(self, segs, control_net, strength, segs_preprocessor=None):
+        new_segs = []
+
+        for seg in segs[1]:
+            control_net_wrapper = impact.core.ControlNetWrapper(control_net, strength, segs_preprocessor)
+            new_seg = SEG(seg.cropped_image, seg.cropped_mask, seg.confidence, seg.crop_region, seg.bbox, seg.label, control_net_wrapper)
+            new_segs.append(new_seg)
+
+        return ((segs[0], new_segs), )
+
+
+class StringSelector:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+            "strings": ("STRING", {"multiline": True}),
+            "multiline": ("BOOLEAN", {"default": False, "label_on": "enabled", "label_off": "disabled"}),
+            "select": ("INT", {"min": 0, "max": sys.maxsize, "step": 1, "default": 0}),
+        }}
+
+    RETURN_TYPES = ("STRING",)
+    OUTPUT_IS_LIST = (True,)
+    FUNCTION = "doit"
+
+    CATEGORY = "ImpactPack/Util"
+
+    def doit(self, strings, multiline, select):
+        lines = strings.split('\n')
+
+        if multiline:
+            result = []
+            current_string = ""
+
+            for line in lines:
+                if line.startswith("#"):
+                    if current_string:
+                        result.append(current_string.strip())
+                        current_string = ""
+                current_string += line + "\n"
+
+            if current_string:
+                result.append(current_string.strip())
+
+            if len(result) == 0:
+                selected = strings
+            else:
+                selected = result[select % len(result)]
+
+            if selected.startswith('#'):
+                selected = selected[1:]
+        else:
+            if len(lines) == 0:
+                selected = strings
+            else:
+                selected = lines[select % len(lines)]
+
+        return (selected, )
+
+
+from impact.utils import any_typ
+
+class ImpactLogger:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+                        "data": (any_typ, ""),
+                    },
+                "hidden": {"prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO"},
+                }
+
+    CATEGORY = "ImpactPack/Debug"
+
+    OUTPUT_NODE = True
+
+    RETURN_TYPES = ()
+    FUNCTION = "doit"
+
+    def doit(self, data, prompt, extra_pnginfo):
+        shape = ""
+        if hasattr(data, "shape"):
+            shape = f"{data.shape} / "
+
+        print(f"[IMPACT LOGGER]: {shape}{data}")
+
+        print(f"         PROMPT: {prompt}")
+
+        # for x in prompt:
+        #     if 'inputs' in x and 'populated_text' in x['inputs']:
+        #         print(f"PROMP: {x['10']['inputs']['populated_text']}")
+        #
+        # for x in extra_pnginfo['workflow']['nodes']:
+        #     if x['type'] == 'ImpactWildcardProcessor':
+        #         print(f" WV : {x['widgets_values'][1]}\n")
+
+        return {}
+
+
+class ImpactDummyInput:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {}}
+
+    CATEGORY = "ImpactPack/Debug"
+
+    RETURN_TYPES = (any_typ,)
+    FUNCTION = "doit"
+
+    def doit(self):
+        return ("DUMMY",)
