@@ -78,6 +78,9 @@ def bitwise_and_masks(mask1, mask2):
 
 
 def to_binary_mask(mask, threshold=0):
+    if len(mask.shape) == 3:
+        mask = mask.squeeze(0)
+
     mask = mask.clone().cpu()
     mask[mask > threshold] = 1.
     mask[mask <= threshold] = 0.
@@ -88,8 +91,15 @@ def dilate_mask(mask, dilation_factor, iter=1):
     if dilation_factor == 0:
         return mask
 
-    kernel = np.ones((dilation_factor,dilation_factor), np.uint8)
-    return cv2.dilate(mask, kernel, iter)
+    if len(mask.shape) == 3:
+        mask = mask.squeeze(0)
+
+    if dilation_factor > 0:
+        kernel = np.ones((dilation_factor, dilation_factor), np.uint8)
+        return cv2.dilate(mask, kernel, iter)
+    else:
+        kernel = np.ones((-dilation_factor, -dilation_factor), np.uint8)
+        return cv2.erode(mask, kernel, iter)
 
 
 def dilate_masks(segmasks, dilation_factor, iter=1):
@@ -97,7 +107,7 @@ def dilate_masks(segmasks, dilation_factor, iter=1):
         return segmasks
 
     dilated_masks = []
-    kernel = np.ones((dilation_factor,dilation_factor), np.uint8)
+    kernel = np.ones((dilation_factor, dilation_factor), np.uint8)
     for i in range(len(segmasks)):
         cv2_mask = segmasks[i][1]
         dilated_mask = cv2.dilate(cv2_mask, kernel, iter)
@@ -158,7 +168,7 @@ def normalize_region(limit, startp, size):
     return int(new_startp), int(new_endp)
 
 
-def make_crop_region(w, h, bbox, crop_factor):
+def make_crop_region(w, h, bbox, crop_factor, crop_min_size=None):
     x1 = bbox[0]
     y1 = bbox[1]
     x2 = bbox[2]
@@ -169,6 +179,10 @@ def make_crop_region(w, h, bbox, crop_factor):
 
     crop_w = bbox_w * crop_factor
     crop_h = bbox_h * crop_factor
+
+    if crop_min_size is not None:
+        crop_w = max(crop_min_size, crop_w)
+        crop_h = max(crop_min_size, crop_h)
 
     kernel_x = x1 + bbox_w / 2
     kernel_y = y1 + bbox_h / 2

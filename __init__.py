@@ -21,7 +21,7 @@ sys.path.append(modules_path)
 
 
 import impact.config
-import impact.hacky
+import impact.sample_error_enhancer
 print(f"### Loading: ComfyUI-Impact-Pack ({impact.config.version})")
 
 
@@ -88,7 +88,6 @@ def setup_js():
         shutil.copy(js_src_path, js_dest_path)
 
 
-    
 setup_js()
 
 from impact.impact_pack import *
@@ -96,6 +95,8 @@ from impact.detectors import *
 from impact.pipe import *
 from impact.logics import *
 from impact.util_nodes import *
+from impact.segs_nodes import *
+from impact.special_samplers import *
 
 impact.wildcards.read_wildcard_dict(wildcards_path)
 impact.wildcards.read_wildcard_dict(custom_wildcards_path)
@@ -157,16 +158,27 @@ NODE_CLASS_MAPPINGS = {
     "Segs & Mask ForEach": SegsBitwiseAndMaskForEach,
     "EmptySegs": EmptySEGS,
 
+    "MediaPipeFaceMeshToSEGS": MediaPipeFaceMeshToSEGS,
     "MaskToSEGS": MaskToSEGS,
     "ToBinaryMask": ToBinaryMask,
     "MasksToMaskList": MasksToMaskList,
+    "MaskListToMaskBatch": MaskListToMaskBatch,
+    "ImageListToImageBatch": ImageListToMaskBatch,
 
     "BboxDetectorSEGS": BboxDetectorForEach,
     "SegmDetectorSEGS": SegmDetectorForEach,
-    "ONNXDetectorSEGS": ONNXDetectorForEach,
+    "ONNXDetectorSEGS": BboxDetectorForEach,
     "ImpactSimpleDetectorSEGS": SimpleDetectorForEach,
     "ImpactSimpleDetectorSEGSPipe": SimpleDetectorForEachPipe,
     "ImpactControlNetApplySEGS": ControlNetApplySEGS,
+
+    "ImpactDecomposeSEGS": DecomposeSEGS,
+    "ImpactAssembleSEGS": AssembleSEGS,
+    "ImpactFrom_SEG_ELT": From_SEG_ELT,
+    "ImpactEdit_SEG_ELT": Edit_SEG_ELT,
+    "ImpactDilate_Mask_SEG_ELT": Dilate_SEG_ELT,
+    "ImpactDilateMask": DilateMask,
+    "ImpactScaleBy_BBOX_SEG_ELT": SEG_ELT_BBOX_ScaleBy,
 
     "BboxDetectorCombined_v2": BboxDetectorCombined,
     "SegmDetectorCombined_v2": SegmDetectorCombined,
@@ -188,6 +200,7 @@ NODE_CLASS_MAPPINGS = {
     "LatentSwitch": GeneralSwitch,
     "SEGSSwitch": GeneralSwitch,
     "ImpactSwitch": GeneralSwitch,
+    "ImpactInversedSwitch": GeneralInversedSwitch,
 
     # "SaveConditioning": SaveConditioning,
     # "LoadConditioning": LoadConditioning,
@@ -200,7 +213,9 @@ NODE_CLASS_MAPPINGS = {
     "SEGSPreview": SEGSPreview,
     "SEGSToImageList": SEGSToImageList,
     "ImpactSEGSToMaskList": SEGSToMaskList,
+    "ImpactSEGSToMaskBatch": SEGSToMaskBatch,
     "ImpactSEGSConcat": SEGSConcat,
+    "ImpactSEGSPicker": SEGSPicker,
 
     "ImpactKSamplerBasicPipe": KSamplerBasicPipe,
     "ImpactKSamplerAdvancedBasicPipe": KSamplerAdvancedBasicPipe,
@@ -210,10 +225,14 @@ NODE_CLASS_MAPPINGS = {
 
     "ImpactImageBatchToImageList": ImageBatchToImageList,
     "ImpactMakeImageList": MakeImageList,
+    "ImpactMakeImageBatch": MakeImageBatch,
 
     "RegionalSampler": RegionalSampler,
+    "RegionalSamplerAdvanced": RegionalSamplerAdvanced,
     "CombineRegionalPrompts": CombineRegionalPrompts,
     "RegionalPrompt": RegionalPrompt,
+
+    "ImpactCombineConditionings": CombineConditionings,
 
     "ImpactSEGSLabelFilter": SEGSLabelFilter,
     "ImpactSEGSRangeFilter": SEGSRangeFilter,
@@ -235,13 +254,18 @@ NODE_CLASS_MAPPINGS = {
 
     "ImpactLogger": ImpactLogger,
     "ImpactDummyInput": ImpactDummyInput,
+
+    "ImpactQueueTrigger": ImpactQueueTrigger,
+    "ImpactSetWidgetValue": ImpactSetWidgetValue,
+    "ImpactNodeSetMuteState": ImpactNodeSetMuteState,
+    "ImpactControlBridge": ImpactControlBridge,
 }
 
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "BboxDetectorSEGS": "BBOX Detector (SEGS)",
     "SegmDetectorSEGS": "SEGM Detector (SEGS)",
-    "ONNXDetectorSEGS": "ONNX Detector (SEGS)",
+    "ONNXDetectorSEGS": "ONNX Detector (SEGS/legacy) - use BBOXDetector",
     "ImpactSimpleDetectorSEGS": "Simple Detector (SEGS)",
     "ImpactSimpleDetectorSEGSPipe": "Simple Detector (SEGS/pipe)",
     "ImpactControlNetApplySEGS": "ControlNetApply (SEGS)",
@@ -249,6 +273,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "BboxDetectorCombined_v2": "BBOX Detector (combined)",
     "SegmDetectorCombined_v2": "SEGM Detector (combined)",
     "SegsToCombinedMask": "SEGS to MASK (combined)",
+    "MediaPipeFaceMeshToSEGS": "MediaPipe FaceMesh to SEGS",
     "MaskToSEGS": "MASK to SEGS",
     "BitwiseAndMaskForEach": "Bitwise(SEGS & SEGS)",
     "SubtractMaskForEach": "Bitwise(SEGS - SEGS)",
@@ -290,19 +315,41 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ImpactSEGSRangeFilter": "SEGS Filter (range)",
     "ImpactSEGSOrderedFilter": "SEGS Filter (ordered)",
     "ImpactSEGSConcat": "SEGS Concat",
+    "ImpactSEGSToMaskList": "SEGS to Mask List",
+    "ImpactSEGSToMaskBatch": "SEGS to Mask Batch",
+    "ImpactSEGSPicker": "Picker (SEGS)",
+
+    "ImpactDecomposeSEGS": "Decompose (SEGS)",
+    "ImpactAssembleSEGS": "Assemble (SEGS)",
+    "ImpactFrom_SEG_ELT": "From SEG_ELT",
+    "ImpactEdit_SEG_ELT": "Edit SEG_ELT",
+    "ImpactDilate_Mask_SEG_ELT": "Dilate Mask (SEG_ELT)",
+    "ImpactScaleBy_BBOX_SEG_ELT": "ScaleBy BBOX (SEG_ELT)",
+    "ImpactDilateMask": "Dilate Mask",
 
     "PreviewBridge": "Preview Bridge",
     "ImageSender": "Image Sender",
     "ImageReceiver": "Image Receiver",
     "ImageMaskSwitch": "Switch (images, mask)",
     "ImpactSwitch": "Switch (Any)",
+    "ImpactInversedSwitch": "Inversed Switch (Any)",
 
     "MasksToMaskList": "Masks to Mask List",
+    "MaskListToMaskBatch": "Mask List to Masks",
     "ImpactImageBatchToImageList": "Image batch to Image List",
+    "ImageListToImageBatch": "Image List to Image Batch",
     "ImpactMakeImageList": "Make Image List",
+    "ImpactMakeImageBatch": "Make Image Batch",
     "ImpactStringSelector": "String Selector",
 
     "RemoveNoiseMask": "Remove Noise Mask",
+
+    "ImpactCombineConditionings": "Combine Conditionings",
+
+    "ImpactQueueTrigger": "Queue Trigger",
+    "ImpactSetWidgetValue": "Set Widget Value",
+    "ImpactNodeSetMuteState": "Set Mute State",
+    "ImpactControlBridge": "Control Bridge",
 
     "LatentSwitch": "Switch (latent/legacy)",
     "SEGSSwitch": "Switch (SEGS/legacy)"

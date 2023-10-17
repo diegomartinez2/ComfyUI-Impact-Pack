@@ -7,6 +7,9 @@ This custom node helps to conveniently enhance images through Detector, Detailer
 
 
 ## NOTICE
+* V4.20.1: Due to the feature update in `RegionalSampler`, the parameter order has changed, causing malfunctions in previously created `RegionalSamplers`. Please adjust the parameters accordingly.
+* V4.12: `MASKS` is changed to `MASK`.
+* V4.7.2 isn't compatible with old version of `ControlNet Auxiliary Preprocessor`. If you will use `MediaPipe FaceMesh to SEGS` update to latest version(Sep. 17th).  
 * Selection weight syntax is changed(: -> ::) since V3.16. ([tutorial](https://github.com/ltdrdata/ComfyUI-extension-tutorials/blob/Main/ComfyUI-Impact-Pack/tutorial/ImpactWildcardProcessor.md))
 * Starting from V3.6, requires latest version(Aug 8, 9ccc965) of ComfyUI.
 * **In versions below V3.3.1, there was an issue with the image quality generated after using the UltralyticsDetectorProvider. Please make sure to upgrade to a newer version.**
@@ -20,20 +23,21 @@ This custom node helps to conveniently enhance images through Detector, Detailer
 
 
 ## Custom Nodes
-* SAMLoader - Loads the SAM model.
-* UltralyticsDetectorProvider - Loads the Ultralystics model to provide SEGM_DETECTOR, BBOX_DETECTOR.
-  - Unlike `MMDetDetectorProvider`, for segm models, `BBOX_DETECTOR` is also provided.
-  - The various models available in UltralyticsDetectorProvider can be downloaded through **ComfyUI-Manager**.
-* ONNXDetectorProvider - Loads the ONNX model to provide SEGM_DETECTOR.
-* CLIPSegDetectorProvider - Wrapper for CLIPSeg to provide BBOX_DETECTOR.
-  * You need to install the ComfyUI-CLIPSeg node extension.
-* SEGM Detector (combined) - Detects segmentation and returns a mask from the input image.
-* BBOX Detector (combined) - Detects bounding boxes and returns a mask from the input image.
-* SAMDetector (combined) - Utilizes the SAM technology to extract the segment at the location indicated by the input SEGS on the input image and outputs it as a unified mask.
-* SAMDetector (Segmented) - It is similar to `SAMDetector (combined)`, but it separates and outputs the detected segments. Multiple segments can be found for the same detected area, and currently, a policy is in place to group them arbitrarily in sets of three. This aspect is expected to be improved in the future.
-  * As a result, it outputs the `combined_mask`, which is a unified mask, and `batch_masks`, which are multiple masks grouped together in batch form.
-  * While `batch_masks` may not be completely separated, it provides functionality to perform some level of segmentation.
-* Simple Detector (SEGS) - Operating primarily with `BBOX_DETECTOR`, and with the additional provision of `SAM_MODEL` or `SEGM_DETECTOR`, this node internally generates improved SEGS through mask operations on both *bbox* and *silhouette*. It serves as a convenient tool to simplify a somewhat intricate workflow.
+* [Detectors](https://github.com/ltdrdata/ComfyUI-extension-tutorials/blob/Main/ComfyUI-Impact-Pack/tutorial/detectors.md)
+  * SAMLoader - Loads the SAM model.
+  * UltralyticsDetectorProvider - Loads the Ultralystics model to provide SEGM_DETECTOR, BBOX_DETECTOR.
+    - Unlike `MMDetDetectorProvider`, for segm models, `BBOX_DETECTOR` is also provided.
+    - The various models available in UltralyticsDetectorProvider can be downloaded through **ComfyUI-Manager**.
+  * ONNXDetectorProvider - Loads the ONNX model to provide BBOX_DETECTOR.
+  * CLIPSegDetectorProvider - Wrapper for CLIPSeg to provide BBOX_DETECTOR.
+    * You need to install the ComfyUI-CLIPSeg node extension.
+  * SEGM Detector (combined) - Detects segmentation and returns a mask from the input image.
+  * BBOX Detector (combined) - Detects bounding boxes and returns a mask from the input image.
+  * SAMDetector (combined) - Utilizes the SAM technology to extract the segment at the location indicated by the input SEGS on the input image and outputs it as a unified mask.
+  * SAMDetector (Segmented) - It is similar to `SAMDetector (combined)`, but it separates and outputs the detected segments. Multiple segments can be found for the same detected area, and currently, a policy is in place to group them arbitrarily in sets of three. This aspect is expected to be improved in the future.
+    * As a result, it outputs the `combined_mask`, which is a unified mask, and `batch_masks`, which are multiple masks grouped together in batch form.
+    * While `batch_masks` may not be completely separated, it provides functionality to perform some level of segmentation.
+  * Simple Detector (SEGS) - Operating primarily with `BBOX_DETECTOR`, and with the additional provision of `SAM_MODEL` or `SEGM_DETECTOR`, this node internally generates improved SEGS through mask operations on both *bbox* and *silhouette*. It serves as a convenient tool to simplify a somewhat intricate workflow.
 
 * ControlNetApply (SEGS) - To apply ControlNet in SEGS, you need to use the Preprocessor Provider node from the Inspire Pack to utilize this node.
 
@@ -47,14 +51,15 @@ This custom node helps to conveniently enhance images through Detector, Detailer
 * Bitwise(MASK + MASK) - Combine two masks.
 * SEGM Detector (SEGS) - Detects segmentation and returns SEGS from the input image.
 * BBOX Detector (SEGS) - Detects bounding boxes and returns SEGS from the input image.
-* ONNX Detector (SEGS) - Utilizes the ONNX model to identify the bbox and retrieve the SEGS from the input image.
 * Detailer (SEGS) - Refines the image based on SEGS.
 * DetailerDebug (SEGS) - Refines the image based on SEGS. Additionally, it provides the ability to monitor the cropped image and the refined image of the cropped image.
   * To prevent regeneration caused by the seed that does not change every time when using 'external_seed', please disable the 'seed random generate' option in the 'Detailer...' node.
 * MASK to SEGS - Generates SEGS based on the mask.
+* MediaPipe FaceMesh to SEGS - Separate each landmark from the mediapipe facemesh image to create labeled SEGS.
+  * Usually, the size of images created through the MediaPipe facemesh preprocessor is downscaled. It resizes the MediaPipe facemesh image to the original size given as reference_image_opt for matching sizes during processing. 
 * ToBinaryMask - Separates the mask generated with alpha values between 0 and 255 into 0 and 255. The non-zero parts are always set to 255.
-* Masks to Mask List - MASKS 
-  * This node converts the MASKS in batch form to a list of individual masks.
+* Masks to Mask List - This node converts the MASKS in batch form to a list of individual masks.
+* Mask List to Masks - This node converts the MASK list to MASK batch form.
 * EmptySEGS - Provides an empty SEGS.
 * MaskPainter - Provides a feature to draw masks.
 * FaceDetailer - Easily detects faces and improves them.
@@ -62,17 +67,26 @@ This custom node helps to conveniently enhance images through Detector, Detailer
 
 * `FromDetailer (SDXL/pipe), BasicPipe -> DetailerPipe (SDXL), Edit DetailerPipe (SDXL)` - These are pipe functions used in Detailer for utilizing the refiner model of SDXL.
 
-* SEGSDetailer - Performs detailed work on SEGS without pasting it back onto the original image.
-* SEGSPaste - Pastes the results of SEGS onto the original image.
-  * If `ref_image_opt` is present, the images contained within SEGS are ignored. Instead, the image within `ref_image_opt` corresponding to the crop area of SEGS is taken and pasted. The size of the image in `ref_image_opt` should be the same as the original image size. 
-* SEGSPreview - Provides a preview of SEGS.
-   * This option is used to preview the improved image through `SEGSDetailer` before merging it into the original. Prior to going through ```SEGSDetailer```, SEGS only contains mask information without image information. If fallback_image_opt is connected to the original image, SEGS without image information will generate a preview using the original image. However, if SEGS already contains image information, fallback_image_opt will be ignored. 
-* SEGSToImageList - Convert SEGS To Image List
-* SEGSToMaskList - Convert SEGS To Mask List
-* SEGS Filter (label) - This node filters SEGS based on the label of the detected areas. 
-* SEGS Filter (ordered) - This node sorts SEGS based on size and position and retrieves SEGs within a certain range. 
-* SEGS Filter (range) - This node retrieves only SEGs from SEGS that have a size and position within a certain range.
-* SEGSConcat - Concatenate segs1 and segs2. If source shape of segs1 and segs2 are different then segs2 will be ignored. 
+* SEGS Manipulation nodes 
+  * SEGSDetailer - Performs detailed work on SEGS without pasting it back onto the original image.
+  * SEGSPaste - Pastes the results of SEGS onto the original image.
+    * If `ref_image_opt` is present, the images contained within SEGS are ignored. Instead, the image within `ref_image_opt` corresponding to the crop area of SEGS is taken and pasted. The size of the image in `ref_image_opt` should be the same as the original image size. 
+  * SEGSPreview - Provides a preview of SEGS.
+     * This option is used to preview the improved image through `SEGSDetailer` before merging it into the original. Prior to going through ```SEGSDetailer```, SEGS only contains mask information without image information. If fallback_image_opt is connected to the original image, SEGS without image information will generate a preview using the original image. However, if SEGS already contains image information, fallback_image_opt will be ignored. 
+  * SEGSToImageList - Convert SEGS To Image List
+  * SEGSToMaskList - Convert SEGS To Mask List
+  * SEGS Filter (label) - This node filters SEGS based on the label of the detected areas. 
+  * SEGS Filter (ordered) - This node sorts SEGS based on size and position and retrieves SEGs within a certain range. 
+  * SEGS Filter (range) - This node retrieves only SEGs from SEGS that have a size and position within a certain range.
+  * SEGSConcat - Concatenate segs1 and segs2. If source shape of segs1 and segs2 are different then segs2 will be ignored.
+  * Picker (SEGS) - Among the input SEGS, you can select a specific SEG through a dialog. If no SEG is selected, it outputs an empty SEGS. Increasing the batch_size of SEGSDetailer can be used for the purpose of selecting from the candidates.
+  * DecomposeSEGS - Decompose SEGS to allow for detailed manipulation.
+  * AssembleSEGS - Reassemble the decomposed SEGS.
+  * From SEG_ELT - Extract detailed information from SEG_ELT.
+  * Edit SEG_ELT - Modify some of the information in SEG_ELT.
+  * Dilate SEG_ELT - Dilate the mask of SEG_ELT.
+
+* Dilate Mask - Dilate Mask. 
  
 * Pipe nodes
    * ToDetailerPipe, FromDetailerPipe - These nodes are used to bundle multiple inputs used in the detailer, such as models and vae, ..., into a single DETAILER_PIPE or extract the elements that are bundled in the DETAILER_PIPE.
@@ -120,13 +134,32 @@ This takes latent as input and outputs latent as the result.
   * Furthermore, LatentSender is implemented with PreviewLatent, which stores the latent in payload form within the image thumbnail.
   * Due to the current structure of ComfyUI, it is unable to distinguish between SDXL latent and SD1.5/SD2.1 latent. Therefore, it generates thumbnails by decoding them using the SD1.5 method.
 
-* Switch (image,mask), Switch (latent), Switch (SEGS) - Among multiple inputs, it selects the input designated by the selector and outputs it. The first input must be provided, while the others are optional. However, if the input specified by the selector is not connected, an error may occur.
-* ImpactWildcardProcessor - The text is generated by processing the wildcard in the Text. If the mode is set to "populate", a dynamic prompt is generated with each execution and the input is filled in the second textbox. If the mode is set to "fixed", the content of the second textbox remains unchanged.
-  * When an image is generated with the "fixed" mode, the prompt used for that particular generation is stored in the metadata.
-* ImpactWildcardEncode - Similar to ImpactWildcardProcessor, this provides the loading functionality of LoRAs (e.g. `<lora:some_awesome_lora:0.7:1.2>`). Populated prompts are encoded using the clip after all the lora loading is done.
+* Switch nodes
+  * Switch (image,mask), Switch (latent), Switch (SEGS) - Among multiple inputs, it selects the input designated by the selector and outputs it. The first input must be provided, while the others are optional. However, if the input specified by the selector is not connected, an error may occur.
+  * Switch (Any) - This is a Switch node that takes an arbitrary number of inputs and produces a single output. Its type is determined when connected to any node, and connecting inputs increases the available slots for connections.
+  * Inversed Switch (Any) - In contrast to `Switch (Any)`, it takes a single input and outputs one of many. Due to ComfyUI's functional limitations, the value of `select` must be determined at the time of queuing a prompt, and while it can serve as a `Primitive Node` or `ImpactInt`, it cannot function properly when connected through other nodes. 
+  * Guide
+    * When the `Switch (Any)` and `Inversed Switch (Any)` selects are transformed into primitives, it's important to be cautious because the select range is not appropriately constrained, potentially leading to unintended behavior.   
+    * `Switch (image,mask)`, `Switch (latent)`, `Switch (SEGS)`, `Switch (Any)` supports `sel_mode` param. The `sel_mode` sets the moment at which the `select` parameter is determined. `select_on_prompt` determines the `select` at the time of queuing the prompt, while `select_on_execution` determines it during the execution of the workflow. While `select_on_execution` offers more flexibility, it can potentially trigger workflow execution errors due to running nodes that may be impossible to execute within the limitations of ComfyUI. `select_on_prompt` bypasses this constraint by treating any inputs not selected as if they were disconnected. However, please note that when using `select_on_prompt`, the `select` can only be used with widgets or `Primitive Nodes` determined at the queue prompt.
+    * There is an issue when connecting the built-in reroute node with the switch's input/output slots. it can lead to forced disconnections during workflow loading. Therefore, it is advisable not to use reroute for making connections in such cases. However, there are no issues when using the reroute node in Pythongossss.
 
-* RegionalSampler, CombineRegionalPrompts, RegionalPrompt - experimental feature
-- multiple region version of TwoAdvancedSamplersForMask 
+* [Wildcards](https://github.com/ltdrdata/ComfyUI-extension-tutorials/blob/Main/ComfyUI-Impact-Pack/tutorial/ImpactWildcard.md) - These are nodes that supports syntax in the form of `__wildcard-name__` and dynamic prompt syntax like `{a|b|c}`.
+  * Wildcard files can be used by placing `.txt` or `.yaml` files under either `ComfyUI-Impact-Pack/wildcards` or `ComfyUI-Impact-Pack/custom_wildcards` paths.
+    * You can download and use [Wildcard YAML](https://civitai.com/models/138970/billions-of-wildcards-all-in-one) files in this format.
+  * ImpactWildcardProcessor - The text is generated by processing the wildcard in the Text. If the mode is set to "populate", a dynamic prompt is generated with each execution and the input is filled in the second textbox. If the mode is set to "fixed", the content of the second textbox remains unchanged.
+    * When an image is generated with the "fixed" mode, the prompt used for that particular generation is stored in the metadata.
+  * ImpactWildcardEncode - Similar to ImpactWildcardProcessor, this provides the loading functionality of LoRAs (e.g. `<lora:some_awesome_lora:0.7:1.2>`). Populated prompts are encoded using the clip after all the lora loading is done.
+    * If the `Inspire Pack` is installed, you can use **Lora Block Weight** in the form of `LBW=lbw spec;`
+    * `<lora:chunli:1.0:1.0:LBW=B11:0,0,0,0,0,0,0,0,0,0,A,0,0,0,0,0,0;A=0.;>`, `<lora:chunli:1.0:1.0:LBW=0,0,0,0,0,0,0,0,0,0,A,B,0,0,0,0,0;A=0.5;B=0.2;>`, `<lora:chunli:1.0:1.0:LBW=SD-MIDD;>`
+
+* Regional Sampling - These nodes offer the capability to divide regions and perform partial sampling using a mask. Unlike TwoSamplersForMask, sampling for each region is applied during each step.
+  * RegionalPrompt - This node combines a **mask** for specifying regions and the **sampler** to apply to each region to create `REGIONAL_PROMPTS`.
+  * CombineRegionalPrompts - Combine multiple `REGIONAL_PROMPTS` to create a single `REGIONAL_PROMPTS`.
+  * RegionalSampler - This node performs sampling using a base sampler and regional prompts. Sampling by the base sampler is executed at each step, while sampling for each region is performed through the sampler bound to each region.
+    * overlap_factor - Specifies the amount of overlap for each region to blend well with the area outside the mask.
+    * restore_latent - When sampling each region, restore the areas outside the mask to the base latent, preventing additional noise from being introduced outside the mask during region sampling.
+  * RegionalSamplerAdvanced - This is the Advanced version of the RegionalSampler. You can control it using `step` instead of `denoise`.
+  * NOTE: The `sde` sampler and `uni_pc` sampler introduce additional noise during each step of the sampling process. To mitigate this, when sampling each region, the `uni_pc` sampler applies additional `dpmpp_fast`, and the sde sampler applies the `dpmpp_2m` sampler as an additional measure.
 
 * KSampler (pipe), KSampler (advanced/pipe)
 
@@ -136,9 +169,22 @@ This takes latent as input and outputs latent as the result.
 * Image batch To Image List - Convert Image batch to Image List
 - You can use images generated in a multi batch to handle them
 * Make Image List - Convert multiple images into a single image list
+* Make Image Batch - Convert multiple images into a single image batch
 - The input of images can be scaled up as needed
 
 * String Selector - It selects and returns a portion of the string. When `multiline` mode is disabled, it simply returns the string of the line pointed to by the selector. When `multiline` mode is enabled, it divides the string based on lines that start with `#` and returns them. If the `select` value is larger than the number of items, it will start counting from the first line again and return accordingly.
+* Combine Conditionings - It takes multiple conditionings as input and combines them into a single conditioning.
+
+* Logics (experimental) - These nodes are experimental nodes designed to implement the logic for loops and dynamic switching.
+  * Queue Trigger - When this node is executed, it adds a new queue to assist with repetitive tasks. It will only execute if the signal's status changes.
+  * Set Widget Value - This node sets one of the optional inputs to the specified node's widget. An error may occur if the types do not match.
+  * Set Mute State - This node changes the mute state of a specific node.
+  * Control Bridge - Depending on whether the mode is set to `block` or `pass`, it changes the mute status of connected nodes. If there are nodes that require a change, the current execution is paused, the mute status is updated, and a new prompt queue is inserted.
+    * **Limitation**: Due to these characteristics, it does not function correctly when the batch count exceeds 1. Additionally, it does not guarantee proper operation when the seed is randomized or when the state of nodes is altered by actions such as `Queue Trigger`, `Set Widget Value`, `Set Mute`, before the Control Bridge.
+    * When utilizing this node, please structure the workflow in such a way that `Queue Trigger`, `Set Widget Value`, `Set Mute State`, and similar actions are executed at the end of the workflow.
+    * If you want to change the value of the seed at each iteration, please ensure that Set Widget Value is executed at the end of the workflow instead of using randomization.
+      * It is not a problem if the seed changes due to randomization as long as it occurs after the Control Bridge section.
+  * You can find the `node_id` by checking through [ComfyUI-Manager](https://github.com/ltdrdata/ComfyUI-Manager) using the format `Badge: #ID Nickname`.
 
 ## MMDet nodes
 * MMDetDetectorProvider - Loads the MMDet model to provide BBOX_DETECTOR and SEGM_DETECTOR.
@@ -151,6 +197,7 @@ This takes latent as input and outputs latent as the result.
 
 ## Deprecated
 * The following nodes have been kept only for compatibility with existing workflows, and are no longer supported. Please replace them with new nodes.
+   * ONNX Detector (SEGS) - BBOX Detector (SEGS)
    * MMDetLoader -> MMDetDetectorProvider
    * SegsMaskCombine -> SEGS to MASK (combined)
    * BboxDetectorForEach -> BBOX Detector (SEGS)

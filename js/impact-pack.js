@@ -110,9 +110,11 @@ function imgSendHandler(event) {
 						nodes[i].widgets[0].value = `${data.filename} [${data.type}]`;
 
 					let img = new Image();
+					img.onload = (event) => {
+						nodes[i].imgs = [img];
+						nodes[i].size[1] = Math.max(200, nodes[i].size[1]);
+					};
 					img.src = `/view?filename=${data.filename}&type=${data.type}&subfolder=${data.subfolder}`+app.getPreviewFormatParam();
-					nodes[i].imgs = [img];
-					nodes[i].size[1] = Math.max(200, nodes[i].size[1]);
 				}
 			}
 		}
@@ -181,37 +183,23 @@ api.addEventListener("executed", progressExecuteHandler);
 app.registerExtension({
 	name: "Comfy.Impack",
 	loadedGraphNode(node, app) {
-		if (node.comfyClass == "PreviewBridge" || node.comfyClass == "MaskPainter") {
+		if (node.comfyClass == "MaskPainter") {
 			input_dirty[node.id + ""] = true;
 		}
 	},
 
 	async beforeRegisterNodeDef(nodeType, nodeData, app) {
-		if (nodeData.name == "IterativeLatentUpscale" || nodeData.name == "IterativeImageUpscale") {
+		if (nodeData.name == "IterativeLatentUpscale" || nodeData.name == "IterativeImageUpscale"
+		    || nodeData.name == "RegionalSampler"|| nodeData.name == "RegionalSamplerAdvanced") {
 			impactProgressBadge.addStatusHandler(nodeType);
 		}
 
-        if (nodeData.name === 'ImpactMakeImageList' || nodeData.name === 'ImpactSwitch' || nodeData.name === 'LatentSwitch' || nodeData.name == 'SEGSSwitch') {
-            var input_name = "input";
+        if(nodeData.name === 'ImpactInversedSwitch') {
+            nodeData.output = ['*'];
+            nodeData.output_is_list = [false];
+            nodeData.output_name = ['output1'];
 
-            switch(nodeData.name) {
-            case 'ImpactMakeImageList':
-                input_name = "image";
-                break;
-
-            case 'LatentSwitch':
-                input_name = "input";
-                break;
-
-            case 'SEGSSwitch':
-                input_name = "input";
-                break;
-
-            case 'ImpactSwitch':
-                input_name = "input";
-            }
-
-            const onConnectionsChange = nodeType.prototype.onConnectionsChange
+            const onConnectionsChange = nodeType.prototype.onConnectionsChange;
             nodeType.prototype.onConnectionsChange = function (type, index, connected, link_info) {
                 if(!link_info)
                     return;
@@ -219,14 +207,17 @@ app.registerExtension({
                 if(type == 2) {
                     // connect output
                     if(connected){
+                        if(app.graph._nodes_by_id[link_info.target_id].type == 'Reroute') {
+                            app.graph._nodes_by_id[link_info.target_id].disconnectInput(link_info.target_slot);
+                        }
+
                         if(this.outputs[0].type == '*'){
                             if(link_info.type == '*') {
-                                this.disconnectOutput(link_info.origin_slot);
+                                app.graph._nodes_by_id[link_info.target_id].disconnectInput(link_info.target_slot);
                             }
                             else {
                                 // propagate type
                                 this.outputs[0].type = link_info.type;
-                                this.outputs[0].label = link_info.type;
                                 this.outputs[0].name = link_info.type;
 
                                 for(let i in this.inputs) {
@@ -236,10 +227,11 @@ app.registerExtension({
                             }
                         }
                     }
-
-                    return;
                 }
                 else {
+                    if(app.graph._nodes_by_id[link_info.origin_id].type == 'Reroute')
+                        this.disconnectInput(link_info.target_slot);
+
                     // connect input
                     if(this.inputs[0].type == '*'){
                         const node = app.graph.getNodeById(link_info.origin_id);
@@ -256,14 +248,146 @@ app.registerExtension({
                         }
 
                         this.outputs[0].type = origin_type;
+                        this.outputs[0].name = origin_type;
+                    }
+
+                    return;
+                }
+
+                if (!connected && this.outputs.length > 1) {
+                    const stackTrace = new Error().stack;
+
+                    if(
+                        !stackTrace.includes('LGraphNode.prototype.connect') && // for touch device
+                        !stackTrace.includes('LGraphNode.connect') && // for mouse device
+                        !stackTrace.includes('loadGraphData')) {
+                            if(this.outputs[link_info.origin_slot].links.length == 0)
+                                this.removeOutput(link_info.origin_slot);
+                    }
+                }
+
+				let slot_i = 1;
+                for (let i = 0; i < this.outputs.length; i++) {
+                    this.outputs[i].name = `output${slot_i}`
+                    slot_i++;
+                }
+
+				let last_slot = this.outputs[this.outputs.length - 1];
+                if (last_slot.slot_index == link_info.origin_slot) {
+                    this.addOutput(`output${slot_i}`, this.outputs[0].type);
+                }
+
+                let select_slot = this.inputs.find(x => x.name == "select");
+                if(this.widgets) {
+                    this.widgets[0].options.max = select_slot?this.outputs.length-1:this.outputs.length;
+                    this.widgets[0].value = Math.min(this.widgets[0].value, this.widgets[0].options.max);
+                    if(this.widgets[0].options.max > 0 && this.widgets[0].value == 0)
+                        this.widgets[0].value = 1;
+                }
+            }
+        }
+
+        if (nodeData.name === 'ImpactMakeImageList' || nodeData.name === 'ImpactMakeImageBatch' ||
+            nodeData.name === 'CombineRegionalPrompts' || nodeData.name === 'ImpactCombineConditionings' ||
+            nodeData.name === 'ImpactSwitch' || nodeData.name === 'LatentSwitch' || nodeData.name == 'SEGSSwitch') {
+            var input_name = "input";
+
+            switch(nodeData.name) {
+            case 'ImpactMakeImageList':
+            case 'ImpactMakeImageBatch':
+                input_name = "image";
+                break;
+
+            case 'CombineRegionalPrompts':
+                input_name = "regional_prompts";
+                break;
+
+            case 'ImpactCombineConditionings':
+                input_name = "conditioning";
+                break;
+
+            case 'LatentSwitch':
+                input_name = "input";
+                break;
+
+            case 'SEGSSwitch':
+                input_name = "input";
+                break;
+
+            case 'ImpactSwitch':
+                input_name = "input";
+            }
+
+            const onConnectionsChange = nodeType.prototype.onConnectionsChange;
+            nodeType.prototype.onConnectionsChange = function (type, index, connected, link_info) {
+                if(!link_info)
+                    return;
+
+                if(type == 2) {
+                    // connect output
+                    if(connected && index == 0){
+                        if(nodeData.name == 'ImpactSwitch' && app.graph._nodes_by_id[link_info.target_id]?.type == 'Reroute') {
+                            app.graph._nodes_by_id[link_info.target_id].disconnectInput(link_info.target_slot);
+                        }
+
+                        if(this.outputs[0].type == '*'){
+                            if(link_info.type == '*') {
+                                app.graph._nodes_by_id[link_info.target_id].disconnectInput(link_info.target_slot);
+                            }
+                            else {
+                                // propagate type
+                                this.outputs[0].type = link_info.type;
+                                this.outputs[0].label = link_info.type;
+                                this.outputs[0].name = link_info.type;
+
+                                for(let i in this.inputs) {
+                                    let input_i = this.inputs[i];
+                                    if(input_i.name != 'select' && input_i.name != 'sel_mode')
+                                        input_i.type = link_info.type;
+                                }
+                            }
+                        }
+                    }
+
+                    return;
+                }
+                else {
+                    if(nodeData.name == 'ImpactSwitch' && app.graph._nodes_by_id[link_info.origin_id].type == 'Reroute')
+                        this.disconnectInput(link_info.target_slot);
+
+                    // connect input
+                    if(this.inputs[index].name == 'select' || this.inputs[index].name == 'sel_mode')
+                        return;
+
+                    if(this.inputs[0].type == '*'){
+                        const node = app.graph.getNodeById(link_info.origin_id);
+                        let origin_type = node.outputs[link_info.origin_slot].type;
+
+                        if(origin_type == '*') {
+                            this.disconnectInput(link_info.target_slot);
+                            return;
+                        }
+
+                        for(let i in this.inputs) {
+                            let input_i = this.inputs[i];
+                            if(input_i.name != 'select' && input_i.name != 'sel_mode')
+                                input_i.type = origin_type;
+                        }
+
+                        this.outputs[0].type = origin_type;
                         this.outputs[0].label = origin_type;
                         this.outputs[0].name = origin_type;
                     }
                 }
 
                 let select_slot = this.inputs.find(x => x.name == "select");
+                let mode_slot = this.inputs.find(x => x.name == "sel_mode");
 
-                if (!connected && (select_slot && this.inputs.length > 2) || (!select_slot && this.inputs.length > 1)) {
+                let converted_count = 0;
+                converted_count += select_slot?1:0;
+                converted_count += mode_slot?1:0;
+
+                if (!connected && (this.inputs.length > 1+converted_count)) {
                     const stackTrace = new Error().stack;
 
                     if(
@@ -277,22 +401,22 @@ app.registerExtension({
 
 				let slot_i = 1;
                 for (let i = 0; i < this.inputs.length; i++) {
-                    if(this.inputs[i].name != 'select') {
-	                    this.inputs[i].label = `${input_name}${slot_i}`
-	                    this.inputs[i].name = `${input_name}${slot_i}`
+                    let input_i = this.inputs[i];
+                    if(input_i.name != 'select'&& input_i.name != 'sel_mode') {
+	                    input_i.name = `${input_name}${slot_i}`
                         slot_i++;
                     }
                 }
 
 				let last_slot = this.inputs[this.inputs.length - 1];
                 if (
-                    (last_slot.name == 'select' && this.inputs[this.inputs.length - 2].link != undefined)
-                    || (last_slot.name != 'select' && last_slot.link != undefined)) {
+                    (last_slot.name == 'select' && last_slot.name != 'sel_mode' && this.inputs[this.inputs.length - 2].link != undefined)
+                    || (last_slot.name != 'select' && last_slot.name != 'sel_mode' && last_slot.link != undefined)) {
                         this.addInput(`${input_name}${slot_i}`, this.outputs[0].type);
                 }
 
                 if(this.widgets) {
-                    this.widgets[0].options.max = select_slot?this.inputs.length-2:this.inputs.length-1;
+                    this.widgets[0].options.max = select_slot?this.inputs.length-1:this.inputs.length;
                     this.widgets[0].value = Math.min(this.widgets[0].value, this.widgets[0].options.max);
                     if(this.widgets[0].options.max > 0 && this.widgets[0].value == 0)
                         this.widgets[0].value = 1;
@@ -359,6 +483,7 @@ app.registerExtension({
 		if(node.comfyClass == "ImpactWildcardEncode" || node.comfyClass == "ToDetailerPipe" || node.comfyClass == "ToDetailerPipeSDXL"
 		|| node.comfyClass == "EditDetailerPipe" || node.comfyClass == "BasicPipeToDetailerPipe" || node.comfyClass == "BasicPipeToDetailerPipeSDXL") {
 			node._value = "Select the LoRA to add to the text";
+			node._wvalue = "Select the Wildcard to add to the text";
 
             var tbox_id = 0;
             var combo_id = 3;
@@ -372,12 +497,33 @@ app.registerExtension({
                 case "ToDetailerPipe":
 		        case "ToDetailerPipeSDXL":
                 case "EditDetailerPipe":
+                case "EditDetailerPipeSDXL":
                 case "BasicPipeToDetailerPipe":
 		        case "BasicPipeToDetailerPipeSDXL":
                     tbox_id = 0;
                     combo_id = 1;
                     break;
             }
+
+			Object.defineProperty(node.widgets[combo_id+1], "value", {
+				set: (value) => {
+				        const stackTrace = new Error().stack;
+                        if(stackTrace.includes('inner_value_change')) {
+                            if(value != "Select the Wildcard to add to the text") {
+                                if(node.widgets[tbox_id].value != '')
+                                    node.widgets[tbox_id].value += ', '
+
+
+	                            node.widgets[tbox_id].value += value;
+                            }
+                        }
+
+						node._wvalue = value;
+					},
+				get: () => {
+                        return node._wvalue;
+					 }
+			});
 
 			Object.defineProperty(node.widgets[combo_id], "value", {
 				set: (value) => {
@@ -403,8 +549,10 @@ app.registerExtension({
 					 }
 			});
 
+
 			// Preventing validation errors from occurring in any situation.
 			node.widgets[combo_id].serializeValue = () => { return "Select the LoRA to add to the text"; }
+			node.widgets[combo_id+1].serializeValue = () => { return "Select the Wildcard to add to the text"; }
 		}
 
 		if(node.comfyClass == "ImpactWildcardProcessor" || node.comfyClass == "ImpactWildcardEncode") {
@@ -494,7 +642,7 @@ app.registerExtension({
             populated_text_widget.serializeValue = force_serializeValue;
 		}
 
-		if (node.comfyClass == "PreviewBridge" || node.comfyClass == "MaskPainter") {
+		if (node.comfyClass == "MaskPainter") {
 			node.widgets[0].value = '#placeholder';
 
 			Object.defineProperty(node, "images", {
@@ -525,16 +673,28 @@ app.registerExtension({
 								forward_type: app.nodeOutputs[id]['aux'][1][0]['type']
 							};
 
-						app.nodeOutputs[id].images = [{
-								...node._images[0],
-								...item
-							}];
+						if(node._images) {
+							app.nodeOutputs[id].images = [{
+									...node._images[0],
+									...item
+								}];
 
-						node.widgets[0].value =
-							{
-								...node._images[0],
-								...item
-							};
+							node.widgets[0].value =
+								{
+									...node._images[0],
+									...item
+								};
+						}
+						else {
+							app.nodeOutputs[id].images = [{
+									...item
+								}];
+
+							node.widgets[0].value =
+								{
+									...item
+								};
+						}
 
 						if(need_invalidate) {
 							Promise.all(
