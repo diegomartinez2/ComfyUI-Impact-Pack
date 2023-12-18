@@ -4,12 +4,22 @@ import os
 import nodes
 import folder_paths
 import yaml
+import threading
 
+
+wildcard_lock = threading.Lock()
 wildcard_dict = {}
 
 
 def get_wildcard_list():
-    return [f"__{x}__" for x in wildcard_dict.keys()]
+    with wildcard_lock:
+        return [f"__{x}__" for x in wildcard_dict.keys()]
+
+
+def get_wildcard_dict():
+    global wildcard_dict
+    with wildcard_lock:
+        return wildcard_dict
 
 
 def wildcard_normalize(x):
@@ -81,8 +91,11 @@ def process(text, seed=None):
                     b = r.group(1).strip()
                 else:
                     a = r.group(1).strip()
-                    b = r.group(3).strip()
-
+                    try:
+                        b = r.group(3).strip()
+                    except:
+                        b = None
+                        
                 if r is not None:
                     if b is not None and is_numeric_string(a) and is_numeric_string(b):
                         # PATTERN: num1-num2
@@ -148,8 +161,8 @@ def process(text, seed=None):
         return replaced_string, replacements_found
 
     def replace_wildcard(string):
-        global wildcard_dict
-        pattern = r"__([\w.\-/*\\]+)__"
+        local_wildcard_dict = get_wildcard_dict()
+        pattern = r"__([\w.\-+/*\\]+)__"
         matches = re.findall(pattern, string)
 
         replacements_found = False
@@ -157,15 +170,15 @@ def process(text, seed=None):
         for match in matches:
             keyword = match.lower()
             keyword = wildcard_normalize(keyword)
-            if keyword in wildcard_dict:
-                replacement = random.choice(wildcard_dict[keyword])
+            if keyword in local_wildcard_dict:
+                replacement = random.choice(local_wildcard_dict[keyword])
                 replacements_found = True
                 string = string.replace(f"__{match}__", replacement, 1)
             elif '*' in keyword:
-                subpattern = keyword.replace('*', '.*')
+                subpattern = keyword.replace('*', '.*').replace('+','\+')
                 total_patterns = []
                 found = False
-                for k, v in wildcard_dict.items():
+                for k, v in local_wildcard_dict.items():
                     if re.match(subpattern, k) is not None:
                         total_patterns += v
                         found = True
@@ -290,9 +303,13 @@ def process_with_loras(wildcard_opt, model, clip, clip_encoder=None):
         if (lora_name.split('.')[-1]) not in folder_paths.supported_pt_extensions:
             lora_name = lora_name+".safetensors"
 
+        orig_lora_name = lora_name
         lora_name = resolve_lora_name(lora_name_cache, lora_name)
 
-        path = folder_paths.get_full_path("loras", lora_name)
+        if lora_name is not None:
+            path = folder_paths.get_full_path("loras", lora_name)
+        else:
+            path = None
 
         if path is not None:
             print(f"LOAD LORA: {lora_name}: {model_weight}, {clip_weight}, LBW={lbw}, A={lbw_a}, B={lbw_b}")
@@ -310,7 +327,7 @@ def process_with_loras(wildcard_opt, model, clip, clip_encoder=None):
             else:
                 model, clip = default_lora()
         else:
-            print(f"LORA NOT FOUND: {lora_name}")
+            print(f"LORA NOT FOUND: {orig_lora_name}")
 
     print(f"CLIP: {pass2}")
 
@@ -318,3 +335,82 @@ def process_with_loras(wildcard_opt, model, clip, clip_encoder=None):
         return model, clip, nodes.CLIPTextEncode().encode(clip, pass2)[0]
     else:
         return model, clip, clip_encoder.encode(clip, pass2)[0]
+
+
+def starts_with_regex(pattern, text):
+    regex = re.compile(pattern)
+    return bool(regex.match(text))
+
+
+def split_to_dict(text):
+    pattern = r'\[([A-Za-z0-9_. ]+)\]([^\[]+)(?=\[|$)'
+    matches = re.findall(pattern, text)
+
+    result_dict = {key: value.strip() for key, value in matches}
+
+    return result_dict
+
+
+class WildcardChooser:
+    def __init__(self, items, randomize_when_exhaust):
+        self.i = 0
+        self.items = items
+        self.randomize_when_exhaust = randomize_when_exhaust
+
+    def get(self, seg):
+        if self.i >= len(self.items):
+            self.i = 0
+            if self.randomize_when_exhaust:
+                random.shuffle(self.items)
+
+        item = self.items[self.i]
+        self.i += 1
+
+        return item
+
+
+class WildcardChooserDict:
+    def __init__(self, items):
+        self.items = items
+
+    def get(self, seg):
+        text = ""
+        if 'ALL' in self.items:
+            text = self.items['ALL']
+
+        if seg.label in self.items:
+            text += self.items[seg.label]
+
+        return text
+
+
+def process_wildcard_for_segs(wildcard):
+    if wildcard.startswith('[LAB]'):
+        raw_items = split_to_dict(wildcard)
+
+        items = {}
+        for k, v in raw_items.items():
+            v = v.strip()
+            if v != '':
+                items[k] = v
+
+        return 'LAB', WildcardChooserDict(items)
+
+    elif starts_with_regex(r"\[(ASC|DSC|RND)\]", wildcard):
+        mode = wildcard[1:4]
+        raw_items = wildcard[5:].split('[SEP]')
+
+        items = []
+        for x in raw_items:
+            x = x.strip()
+            if x != '':
+                items.append(x)
+
+        if mode == 'RND':
+            random.shuffle(items)
+            return mode, WildcardChooser(items, True)
+        else:
+            return mode, WildcardChooser(items, False)
+
+    else:
+        return None, WildcardChooser([wildcard], False)

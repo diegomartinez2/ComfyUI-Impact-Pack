@@ -43,25 +43,24 @@ def set_previewbridge_image(node_id, file, item):
 
 
 def erosion_mask(mask, grow_mask_by):
-    if len(mask.shape) == 3:
-        mask = mask.squeeze(0)
+    mask = make_2d_mask(mask)
 
     w = mask.shape[1]
     h = mask.shape[0]
 
-    mask = mask.clone()
-
+    device = comfy.model_management.get_torch_device()
+    mask = mask.clone().to(device)
     mask2 = torch.nn.functional.interpolate(mask.reshape((-1, 1, mask.shape[-2], mask.shape[-1])), size=(w, h),
-                                            mode="bilinear")
+                                            mode="bilinear").to(device)
     if grow_mask_by == 0:
         mask_erosion = mask2
     else:
-        kernel_tensor = torch.ones((1, 1, grow_mask_by, grow_mask_by))
+        kernel_tensor = torch.ones((1, 1, grow_mask_by, grow_mask_by)).to(device)
         padding = math.ceil((grow_mask_by - 1) / 2)
 
         mask_erosion = torch.clamp(torch.nn.functional.conv2d(mask2.round(), kernel_tensor, padding=padding), 0, 1)
 
-    return mask_erosion[:, :, :w, :h].round()
+    return mask_erosion[:, :, :w, :h].round().cpu()
 
 
 def ksampler_wrapper(model, seed, steps, cfg, sampler_name, scheduler, positive, negative, latent_image, denoise,
@@ -104,8 +103,7 @@ def ksampler_wrapper(model, seed, steps, cfg, sampler_name, scheduler, positive,
 
 class REGIONAL_PROMPT:
     def __init__(self, mask, sampler):
-        if len(mask.shape) == 3:
-            mask = mask.squeeze(0)
+        mask = make_2d_mask(mask)
 
         self.mask = mask
         self.sampler = sampler
@@ -115,6 +113,7 @@ class REGIONAL_PROMPT:
     def get_mask_erosion(self, factor):
         if self.mask_erosion is None or self.erosion_factor != factor:
             self.mask_erosion = erosion_mask(self.mask, factor)
+            self.erosion_factor = factor
 
         return self.mask_erosion
 
@@ -140,8 +139,7 @@ def create_segmasks(results):
 
 
 def gen_detection_hints_from_mask_area(x, y, mask, threshold, use_negative):
-    if len(mask.shape) == 3:
-        mask = mask.squeeze(0)
+    mask = make_2d_mask(mask)
 
     points = []
     plabs = []
@@ -184,7 +182,7 @@ def enhance_detail(image, model, clip, vae, guide_size, guide_size_for_bbox, max
                    scheduler, positive, negative, denoise, noise_mask, force_inpaint, wildcard_opt=None,
                    detailer_hook=None,
                    refiner_ratio=None, refiner_model=None, refiner_clip=None, refiner_positive=None,
-                   refiner_negative=None, control_net_wrapper=None):
+                   refiner_negative=None, control_net_wrapper=None, cycle=1):
     if noise_mask is not None and len(noise_mask.shape) == 3:
         noise_mask = noise_mask.squeeze(0)
 
@@ -242,7 +240,7 @@ def enhance_detail(image, model, clip, vae, guide_size, guide_size_for_bbox, max
     print(f"Detailer: segment upscale for ({bbox_w, bbox_h}) | crop region {w, h} x {upscale} -> {new_w, new_h}")
 
     # upscale
-    upscaled_image = scale_tensor(new_w, new_h, torch.from_numpy(image))
+    upscaled_image = tensor_resize(image, new_w, new_h)
 
     # ksampler
     latent_image = to_latent_image(upscaled_image, vae)
@@ -255,7 +253,7 @@ def enhance_detail(image, model, clip, vae, guide_size, guide_size_for_bbox, max
                                                         mode='bilinear', align_corners=False)
 
         # remove the extra dimensions added by unsqueeze
-        upscaled_mask = upscaled_mask.squeeze().squeeze()
+        upscaled_mask = upscaled_mask.squeeze(0).squeeze(0)
         latent_image['noise_mask'] = upscaled_mask
 
     if detailer_hook is not None:
@@ -265,9 +263,24 @@ def enhance_detail(image, model, clip, vae, guide_size, guide_size_for_bbox, max
     if control_net_wrapper is not None:
         positive, cnet_pil = control_net_wrapper.apply(positive, upscaled_image, upscaled_mask)
 
-    refined_latent = ksampler_wrapper(model, seed, steps, cfg, sampler_name, scheduler, positive, negative,
-                                      latent_image, denoise,
-                                      refiner_ratio, refiner_model, refiner_clip, refiner_positive, refiner_negative)
+    refined_latent = latent_image
+
+    for i in range(0, cycle):
+        if detailer_hook is not None:
+            if detailer_hook is not None:
+                detailer_hook.set_steps((i, cycle))
+
+            refined_latent = detailer_hook.cycle_latent(refined_latent)
+
+            model2, seed2, steps2, cfg2, sampler_name2, scheduler2, positive2, negative2, upscaled_latent2, denoise2 = \
+                detailer_hook.pre_ksample(model, seed+i, steps, cfg, sampler_name, scheduler, positive, negative, latent_image, denoise)
+        else:
+            model2, seed2, steps2, cfg2, sampler_name2, scheduler2, positive2, negative2, upscaled_latent2, denoise2 = \
+                model, seed + i, steps, cfg, sampler_name, scheduler, positive, negative, latent_image, denoise
+
+        refined_latent = ksampler_wrapper(model2, seed2, steps2, cfg2, sampler_name2, scheduler2, positive2, negative2,
+                                          refined_latent, denoise2,
+                                          refiner_ratio, refiner_model, refiner_clip, refiner_positive, refiner_negative)
 
     if detailer_hook is not None:
         refined_latent = detailer_hook.pre_decode(refined_latent)
@@ -279,11 +292,119 @@ def enhance_detail(image, model, clip, vae, guide_size, guide_size_for_bbox, max
         refined_image = detailer_hook.post_decode(refined_image)
 
     # downscale
-    refined_image = scale_tensor_and_to_pil(w, h, refined_image)
+    refined_image = tensor_resize(refined_image, w, h)
 
     # don't convert to latent - latent break image
     # preserving pil is much better
     return refined_image, cnet_pil
+
+
+def enhance_detail_for_animatediff(image_frames, model, clip, vae, guide_size, guide_size_for_bbox, max_size, bbox, seed, steps, cfg,
+                                   sampler_name,
+                                   scheduler, positive, negative, denoise, noise_mask, wildcard_opt=None,
+                                   detailer_hook=None,
+                                   refiner_ratio=None, refiner_model=None, refiner_clip=None, refiner_positive=None,
+                                   refiner_negative=None):
+    if noise_mask is not None and len(noise_mask.shape) == 3:
+        noise_mask = noise_mask.squeeze(0)
+
+    if wildcard_opt is not None and wildcard_opt != "":
+        model, _, positive = wildcards.process_with_loras(wildcard_opt, model, clip)
+
+    h = image_frames.shape[1]
+    w = image_frames.shape[2]
+
+    bbox_h = bbox[3] - bbox[1]
+    bbox_w = bbox[2] - bbox[0]
+
+    # Skip processing if the detected bbox is already larger than the guide_size
+    if guide_size_for_bbox:  # == "bbox"
+        # Scale up based on the smaller dimension between width and height.
+        upscale = guide_size / min(bbox_w, bbox_h)
+    else:
+        # for cropped_size
+        upscale = guide_size / min(w, h)
+
+    new_w = int(w * upscale)
+    new_h = int(h * upscale)
+
+    # safeguard
+    if 'aitemplate_keep_loaded' in model.model_options:
+        max_size = min(4096, max_size)
+
+    if new_w > max_size or new_h > max_size:
+        upscale *= max_size / max(new_w, new_h)
+        new_w = int(w * upscale)
+        new_h = int(h * upscale)
+
+    if upscale <= 1.0 or new_w == 0 or new_h == 0:
+        print(f"Detailer: force inpaint")
+        upscale = 1.0
+        new_w = w
+        new_h = h
+
+    if detailer_hook is not None:
+        new_w, new_h = detailer_hook.touch_scaled_size(new_w, new_h)
+
+    print(f"Detailer: segment upscale for ({bbox_w, bbox_h}) | crop region {w, h} x {upscale} -> {new_w, new_h}")
+
+    # upscale the mask tensor by a factor of 2 using bilinear interpolation
+    noise_mask = torch.from_numpy(noise_mask)
+    upscaled_mask = torch.nn.functional.interpolate(noise_mask.unsqueeze(0).unsqueeze(0), size=(new_h, new_w),
+                                                    mode='bilinear', align_corners=False)
+
+    upscaled_mask = upscaled_mask.squeeze().squeeze()
+
+    latent_frames = None
+    for image in image_frames:
+        image = torch.from_numpy(image).unsqueeze(0)
+
+        # upscale
+        upscaled_image = tensor_resize(image, new_w, new_h)
+
+        # ksampler
+        samples = to_latent_image(upscaled_image, vae)['samples']
+
+        if latent_frames is None:
+            latent_frames = samples
+        else:
+            latent_frames = torch.concat((latent_frames, samples), dim=0)
+
+    upscaled_mask = upscaled_mask.expand(len(image_frames), -1, -1)
+
+    latent = {
+        'noise_mask': upscaled_mask,
+        'samples': latent_frames
+    }
+
+    if detailer_hook is not None:
+        latent = detailer_hook.post_encode(latent)
+
+    refined_latent = ksampler_wrapper(model, seed, steps, cfg, sampler_name, scheduler, positive, negative,
+                                             latent, denoise,
+                                             refiner_ratio, refiner_model, refiner_clip, refiner_positive, refiner_negative)
+
+    if detailer_hook is not None:
+        refined_latent = detailer_hook.pre_decode(refined_latent)
+
+    refined_image_frames = None
+    for refined_sample in refined_latent['samples']:
+        refined_sample = refined_sample.unsqueeze(0)
+
+        # non-latent downscale - latent downscale cause bad quality
+        refined_image = vae.decode(refined_sample)
+
+        if refined_image_frames is None:
+            refined_image_frames = refined_image
+        else:
+            refined_image_frames = torch.concat((refined_image_frames, refined_image), dim=0)
+
+    if detailer_hook is not None:
+        refined_image_frames = detailer_hook.post_decode(refined_image_frames)
+
+    refined_image_frames = nodes.ImageScale().upscale(image=refined_image_frames, upscale_method='lanczos', width=w, height=h, crop='disabled')[0]
+
+    return refined_image_frames
 
 
 def composite_to(dest_latent, crop_region, src_latent):
@@ -550,7 +671,7 @@ def segs_scale_match(segs, target_shape):
     th = target_shape[1]
     tw = target_shape[2]
 
-    if h == th and w == tw:
+    if (h == th and w == tw) or h == 0 or w == 0:
         return segs
 
     rh = th / h
@@ -648,16 +769,28 @@ def make_sam_mask_segmented(sam_model, segs, image, detection_hint, dilation,
         mask = combine_masks2(total_masks)
 
     finally:
-        if sam_model.is_auto_mode:
-            print(f"semd to {device}")
-            sam_model.to(device="cpu")
+        # Temporarily disabling the switch back to CPU after inference.
+        # Rationale: After multiple tests and comparisons, it's concluded that not only does it fail to conserve GPU memory, 
+        # but it also introduces additional IO overhead from transferring the model between devices.
+
+        # if sam_model.is_auto_mode:
+        #     sam_model.to(device=torch.device("cpu"))
+
+        pass
+
+    mask_working_device = torch.device("cpu")
 
     if mask is not None:
         mask = mask.float()
         mask = dilate_mask(mask.cpu().numpy(), dilation)
         mask = torch.from_numpy(mask)
+        mask = mask.to(device=mask_working_device)
     else:
-        mask = torch.zeros((8, 8), dtype=torch.float32, device="cpu")  # empty mask
+        # Extracting batch, height and width
+        height, width, _ = image.shape
+        mask = torch.zeros(
+            (height, width), dtype=torch.float32, device=mask_working_device
+        )  # empty mask
 
     stacked_masks = convert_and_stack_masks(total_masks)
 
@@ -666,8 +799,7 @@ def make_sam_mask_segmented(sam_model, segs, image, detection_hint, dilation,
 
 
 def segs_bitwise_and_mask(segs, mask):
-    if len(mask.shape) == 3:
-        mask = mask.squeeze(0)
+    mask = make_2d_mask(mask)
 
     if mask is None:
         print("[SegsBitwiseAndMask] Cannot operate: MASK is empty.")
@@ -715,6 +847,19 @@ def apply_mask_to_each_seg(segs, masks):
         items.append(item)
 
     return segs[0], items
+
+
+def dilate_segs(segs, factor):
+    if factor == 0:
+        return segs
+
+    new_segs = []
+    for seg in segs[1]:
+        new_mask = dilate_mask(seg.cropped_mask, factor)
+        new_seg = SEG(seg.cropped_image, new_mask, seg.confidence, seg.crop_region, seg.bbox, seg.label, seg.control_net_wrapper)
+        new_segs.append(new_seg)
+
+    return (segs[0], new_segs)
 
 
 class ONNXDetector:
@@ -771,7 +916,7 @@ class ONNXDetector:
         pass
 
 
-def mask_to_segs(mask, combined, crop_factor, bbox_fill, drop_size=1, label='A', crop_min_size=None, detailer_hook=None):
+def mask_to_segs(mask, combined, crop_factor, bbox_fill, drop_size=1, label='A', crop_min_size=None, detailer_hook=None, is_contour=True):
     drop_size = max(drop_size, 1)
     if mask is None:
         print("[mask_to_segs] Cannot operate: MASK is empty.")
@@ -794,8 +939,6 @@ def mask_to_segs(mask, combined, crop_factor, bbox_fill, drop_size=1, label='A',
 
     if len(mask.shape) == 2:
         mask = np.expand_dims(mask, axis=0)
-    else:
-        mask = np.squeeze(mask, axis=1)
 
     for i in range(mask.shape[0]):
         mask_i = mask[i]
@@ -826,7 +969,7 @@ def mask_to_segs(mask, combined, crop_factor, bbox_fill, drop_size=1, label='A',
 
         else:
             mask_i_uint8 = (mask_i * 255.0).astype(np.uint8)
-            contours, _ = cv2.findContours(mask_i_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            contours, _ = cv2.findContours(mask_i_uint8, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
             for contour in contours:
                 separated_mask = np.zeros_like(mask_i_uint8)
                 cv2.drawContours(separated_mask, [contour], 0, 255, -1)
@@ -842,8 +985,13 @@ def mask_to_segs(mask, combined, crop_factor, bbox_fill, drop_size=1, label='A',
                     crop_region = detailer_hook.post_crop_region(mask_i.shape[1], mask_i.shape[0], bbox, crop_region)
 
                 if w > drop_size and h > drop_size:
+                    if is_contour:
+                        mask_src = separated_mask
+                    else:
+                        mask_src = mask_i
+
                     cropped_mask = np.array(
-                        separated_mask[
+                        mask_src[
                             crop_region[1]: crop_region[3],
                             crop_region[0]: crop_region[2],
                         ]
@@ -884,35 +1032,37 @@ def mediapipe_facemesh_to_segs(image, crop_factor, bbox_fill, crop_min_size, dro
         "right_pupil": np.array([0x0A, 0xC8, 0xFA]),
     }
 
-    def create_segment(image, color):
+    def create_segments(image, color):
         image = (image * 255).to(torch.uint8)
         image = image.squeeze(0).numpy()
         mask = cv2.inRange(image, color, color)
 
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if contours:
-            max_contour = max(contours, key=cv2.contourArea)
-            convex_hull = cv2.convexHull(max_contour)
-            convex_segment = np.zeros_like(image)
-            cv2.fillPoly(convex_segment, [convex_hull], (255, 255, 255))
+        contours, ctree = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+        mask_list = []
+        for i, contour in enumerate(contours):
+            hierarchy = ctree[0][i]
+            if hierarchy[3] == -1:
+                convex_hull = cv2.convexHull(contour)
+                convex_segment = np.zeros_like(image)
+                cv2.fillPoly(convex_segment, [convex_hull], (255, 255, 255))
 
-            convex_segment = np.expand_dims(convex_segment, axis=0).astype(np.float32) / 255.0
-            tensor = torch.from_numpy(convex_segment)
-            mask_tensor = torch.any(tensor != 0, dim=-1).float()
-            mask_tensor = mask_tensor.squeeze(0)
-            mask_tensor = torch.from_numpy(dilate_mask(mask_tensor.numpy(), dilation))
-            return mask_tensor.unsqueeze(0).unsqueeze(0)
+                convex_segment = np.expand_dims(convex_segment, axis=0).astype(np.float32) / 255.0
+                tensor = torch.from_numpy(convex_segment)
+                mask_tensor = torch.any(tensor != 0, dim=-1).float()
+                mask_tensor = mask_tensor.squeeze(0)
+                mask_tensor = torch.from_numpy(dilate_mask(mask_tensor.numpy(), dilation))
+                mask_list.append(mask_tensor.unsqueeze(0))
 
-        return None
+        return mask_list
 
     segs = []
 
     def create_seg(label):
-        mask = create_segment(image, parts[label])
-        if mask is not None:
+        mask_list = create_segments(image, parts[label])
+        for mask in mask_list:
             seg = mask_to_segs(mask, False, crop_factor, bbox_fill, drop_size=drop_size, label=label, crop_min_size=crop_min_size)
             if len(seg[1]) > 0:
-                segs.append(seg[1][0])
+                segs.extend(seg[1])
 
     if face:
         create_seg('face')
@@ -969,6 +1119,10 @@ def segs_to_masklist(segs):
         mask[crop_region[1]:crop_region[3], crop_region[0]:crop_region[2]] |= (cropped_mask * 255).astype(np.uint8)
         mask = torch.from_numpy(mask.astype(np.float32) / 255.0)
         masks.append(mask)
+
+    if len(masks) == 0:
+        empty_mask = torch.zeros((h, w), dtype=torch.float32, device="cpu")
+        masks = [empty_mask]
 
     return masks
 
@@ -1102,6 +1256,11 @@ class PixelKSampleHook:
         return w, h
 
 
+class DetailerHook(PixelKSampleHook):
+    def cycle_latent(self, latent):
+        return latent
+
+
 class PixelKSampleHookCombine(PixelKSampleHook):
     hook1 = None
     hook2 = None
@@ -1115,6 +1274,9 @@ class PixelKSampleHookCombine(PixelKSampleHook):
         self.hook1.set_steps(info)
         self.hook2.set_steps(info)
 
+    def pre_decode(self, samples):
+        return self.hook2.pre_decode(self.hook1.pre_decode(samples))
+
     def post_decode(self, pixels):
         return self.hook2.post_decode(self.hook1.post_decode(pixels))
 
@@ -1124,6 +1286,14 @@ class PixelKSampleHookCombine(PixelKSampleHook):
     def post_encode(self, samples):
         return self.hook2.post_encode(self.hook1.post_encode(samples))
 
+    def post_crop_region(self, w, h, item_bbox, crop_region):
+        crop_region = self.hook1.post_crop_region(w, h, item_bbox, crop_region)
+        return self.hook2.post_crop_region(w, h, item_bbox, crop_region)
+
+    def touch_scaled_size(self, w, h):
+        w, h = self.hook1.touch_scaled_size(w, h)
+        return self.hook2.touch_scaled_size(w, h)
+
     def pre_ksample(self, model, seed, steps, cfg, sampler_name, scheduler, positive, negative, upscaled_latent,
                     denoise):
         model, seed, steps, cfg, sampler_name, scheduler, positive, negative, upscaled_latent, denoise = \
@@ -1132,6 +1302,13 @@ class PixelKSampleHookCombine(PixelKSampleHook):
 
         return self.hook2.pre_ksample(model, seed, steps, cfg, sampler_name, scheduler, positive, negative,
                                       upscaled_latent, denoise)
+
+
+class DetailerHookCombine(PixelKSampleHookCombine):
+    def cycle_latent(self, latent):
+        latent = self.hook1.cycle_latent(latent)
+        latent = self.hook2.cycle_latent(latent)
+        return latent
 
 
 class SimpleCfgScheduleHook(PixelKSampleHook):
@@ -1150,8 +1327,6 @@ class SimpleCfgScheduleHook(PixelKSampleHook):
 
 
 class SimpleDenoiseScheduleHook(PixelKSampleHook):
-    target_denoise = 0
-
     def __init__(self, target_denoise):
         super().__init__()
         self.target_denoise = target_denoise
@@ -1162,6 +1337,18 @@ class SimpleDenoiseScheduleHook(PixelKSampleHook):
         gap = self.target_denoise - denoise
         current_denoise = denoise + gap * progress
         return model, seed, steps, cfg, sampler_name, scheduler, positive, negative, upscaled_latent, current_denoise
+
+
+class SimpleDetailerDenoiseSchedulerHook(DetailerHook):
+    def __init__(self, target_denoise):
+        super().__init__()
+        self.target_denoise = target_denoise
+
+    def pre_ksample(self, model, seed, steps, cfg, sampler_name, scheduler, positive, negative, latent, denoise):
+        progress = self.cur_step / self.total_step
+        gap = self.target_denoise - denoise
+        current_denoise = denoise + gap * progress
+        return model, seed, steps, cfg, sampler_name, scheduler, positive, negative, latent, current_denoise
 
 
 def latent_upscale_on_pixel_space_shape(samples, scale_method, w, h, vae, use_tile=False, tile_size=512,
@@ -1179,7 +1366,7 @@ def latent_upscale_on_pixel_space_shape(samples, scale_method, w, h, vae, use_ti
     return vae_encode(vae, pixels, use_tile, hook, tile_size=tile_size)
 
 
-def latent_upscale_on_pixel_space(samples, scale_method, scale_factor, vae, use_tile=False, tile_size=512,
+def latent_upscale_on_pixel_space2(samples, scale_method, scale_factor, vae, use_tile=False, tile_size=512,
                                   save_temp_prefix=None, hook=None):
     pixels = vae_decode(vae, samples, use_tile, hook, tile_size=tile_size)
 
@@ -1193,7 +1380,12 @@ def latent_upscale_on_pixel_space(samples, scale_method, scale_factor, vae, use_
     if hook is not None:
         pixels = hook.post_upscale(pixels)
 
-    return vae_encode(vae, pixels, use_tile, hook, tile_size=tile_size)
+    return (vae_encode(vae, pixels, use_tile, hook, tile_size=tile_size), pixels)
+
+
+def latent_upscale_on_pixel_space(samples, scale_method, scale_factor, vae, use_tile=False, tile_size=512,
+                                  save_temp_prefix=None, hook=None):
+	return latent_upscale_on_pixel_space2(samples, scale_method, scale_factor, vae, use_tile, tile_size, save_temp_prefix, hook)[0]
 
 
 def latent_upscale_on_pixel_space_with_model_shape(samples, scale_method, upscale_model, new_w, new_h, vae,
@@ -1223,7 +1415,7 @@ def latent_upscale_on_pixel_space_with_model_shape(samples, scale_method, upscal
     return vae_encode(vae, pixels, use_tile, hook, tile_size=tile_size)
 
 
-def latent_upscale_on_pixel_space_with_model(samples, scale_method, upscale_model, scale_factor, vae, use_tile=False,
+def latent_upscale_on_pixel_space_with_model2(samples, scale_method, upscale_model, scale_factor, vae, use_tile=False,
                                              tile_size=512, save_temp_prefix=None, hook=None):
     pixels = vae_decode(vae, samples, use_tile, hook, tile_size=tile_size)
 
@@ -1251,26 +1443,20 @@ def latent_upscale_on_pixel_space_with_model(samples, scale_method, upscale_mode
     if hook is not None:
         pixels = hook.post_upscale(pixels)
 
-    return vae_encode(vae, pixels, use_tile, hook, tile_size=tile_size)
+    return (vae_encode(vae, pixels, use_tile, hook, tile_size=tile_size), pixels)
+
+def latent_upscale_on_pixel_space_with_model(samples, scale_method, upscale_model, scale_factor, vae, use_tile=False,
+                                             tile_size=512, save_temp_prefix=None, hook=None):
+    return latent_upscale_on_pixel_space_with_model2(samples, scale_method, upscale_model, scale_factor, vae, use_tile, tile_size, save_temp_prefix, hook)[0]
 
 
 class TwoSamplersForMaskUpscaler:
-    params = None
-    upscale_model = None
-    hook_base = None
-    hook_mask = None
-    hook_full = None
-    use_tiled_vae = False
-    is_tiled = False
-    tile_size = 512
-
     def __init__(self, scale_method, sample_schedule, use_tiled_vae, base_sampler, mask_sampler, mask, vae,
                  full_sampler_opt=None, upscale_model_opt=None, hook_base_opt=None, hook_mask_opt=None,
                  hook_full_opt=None,
                  tile_size=512):
 
-        if len(mask.shape) == 3:
-            mask = mask.squeeze(0)
+        mask = make_2d_mask(mask)
 
         mask = mask.reshape((-1, 1, mask.shape[-2], mask.shape[-1]))
 
@@ -1282,12 +1468,12 @@ class TwoSamplersForMaskUpscaler:
         self.hook_full = hook_full_opt
         self.use_tiled_vae = use_tiled_vae
         self.tile_size = tile_size
+        self.vae = vae
 
     def upscale(self, step_info, samples, upscale_factor, save_temp_prefix=None):
         scale_method, sample_schedule, use_tiled_vae, base_sampler, mask_sampler, mask, vae = self.params
 
-        if len(mask.shape) == 3:
-            mask = mask.squeeze(0)
+        mask = make_2d_mask(mask)
 
         self.prepare_hook(step_info)
 
@@ -1317,8 +1503,7 @@ class TwoSamplersForMaskUpscaler:
     def upscale_shape(self, step_info, samples, w, h, save_temp_prefix=None):
         scale_method, sample_schedule, use_tiled_vae, base_sampler, mask_sampler, mask, vae = self.params
 
-        if len(mask.shape) == 3:
-            mask = mask.squeeze(0)
+        mask = make_2d_mask(mask)
 
         self.prepare_hook(step_info)
 
@@ -1374,8 +1559,7 @@ class TwoSamplersForMaskUpscaler:
             return cur_step % 2 == 0 or cur_step >= total_step - 1
 
     def do_samples(self, step_info, base_sampler, mask_sampler, sample_schedule, mask, upscaled_latent):
-        if len(mask.shape) == 3:
-            mask = mask.squeeze(0)
+        mask = make_2d_mask(mask)
 
         if self.is_full_sample_time(step_info, sample_schedule):
             print(f"step_info={step_info} / full time")
@@ -1387,6 +1571,8 @@ class TwoSamplersForMaskUpscaler:
         else:
             print(f"step_info={step_info} / non-full time")
             # upscale mask
+            if mask.ndim == 2:
+                mask = mask[None, :, :, None]
             upscaled_mask = F.interpolate(mask, size=(
             upscaled_latent['samples'].shape[2], upscaled_latent['samples'].shape[3]),
                                           mode='bilinear', align_corners=True)
@@ -1408,13 +1594,6 @@ class TwoSamplersForMaskUpscaler:
 
 
 class PixelKSampleUpscaler:
-    params = None
-    upscale_model = None
-    hook = None
-    use_tiled_vae = False
-    is_tiled = False
-    tile_size = 512
-
     def __init__(self, scale_method, model, vae, seed, steps, cfg, sampler_name, scheduler, positive, negative, denoise,
                  use_tiled_vae, upscale_model_opt=None, hook_opt=None, tile_size=512):
         self.params = scale_method, model, vae, seed, steps, cfg, sampler_name, scheduler, positive, negative, denoise
@@ -1422,6 +1601,8 @@ class PixelKSampleUpscaler:
         self.hook = hook_opt
         self.use_tiled_vae = use_tiled_vae
         self.tile_size = tile_size
+        self.is_tiled = False
+        self.vae = vae
 
     def upscale(self, step_info, samples, upscale_factor, save_temp_prefix=None):
         scale_method, model, vae, seed, steps, cfg, sampler_name, scheduler, positive, negative, denoise = self.params
@@ -1493,9 +1674,14 @@ class ControlNetWrapper:
         return nodes.ControlNetApply().apply_controlnet(conditioning, self.control_net, image, self.strength)[0], image
 
 
-class CoreMLHook(PixelKSampleHook):
-    def __init__(self):
+class CoreMLHook(DetailerHook):
+    def __init__(self, mode):
         super().__init__()
+        resolution = mode.split('x')
+
+        self.w = int(resolution[0])
+        self.h = int(resolution[1])
+
         self.override_bbox_by_segm = False
 
     def pre_decode(self, samples):
@@ -1514,42 +1700,40 @@ class CoreMLHook(PixelKSampleHook):
         crop_w = x2-x1
         crop_h = y2-y1
 
-        if crop_w < crop_h:
+        crop_ratio = crop_w/crop_h
+        target_ratio = self.w/self.h
+        if crop_ratio < target_ratio:
             # shrink height
             top_gap = by1 - y1
             bottom_gap = y2 - by2
 
-            if top_gap > bottom_gap:
-                ratio = bottom_gap / top_gap
-                delta = (crop_h - crop_w) * (1.0 - ratio)
-            else:
-                ratio = top_gap / bottom_gap
-                delta = (crop_h - crop_w) * ratio
+            gap_ratio = top_gap / bottom_gap
 
-            new_y1 = int(y1 + delta)
-            new_y2 = int(new_y1 + crop_w)
+            target_height = 1/target_ratio*crop_w
+            delta_height = crop_h - target_height
+
+            new_y1 = int(y1 + delta_height*gap_ratio)
+            new_y2 = int(new_y1 + target_height)
             crop_region = x1, new_y1, x2, new_y2
 
-        elif crop_w > crop_h:
+        elif crop_ratio > target_ratio:
             # shrink width
             left_gap = bx1 - x1
             right_gap = x2 - bx2
 
-            if left_gap > right_gap:
-                ratio = right_gap / left_gap
-                delta = (crop_w - crop_h) * (1.0 - ratio)
-            else:
-                ratio = left_gap / right_gap
-                delta = (crop_w - crop_h) * ratio
+            gap_ratio = left_gap / right_gap
 
-            new_x1 = int(x1 + delta)
-            new_x2 = int(new_x1 + crop_h)
+            target_width = target_ratio*crop_h
+            delta_width = crop_w - target_width
+
+            new_x1 = int(x1 + delta_width*gap_ratio)
+            new_x2 = int(new_x1 + target_width)
             crop_region = new_x1, y1, new_x2, y2
 
         return crop_region
 
     def touch_scaled_size(self, w, h):
-        return 512, 512
+        return self.w, self.h
 
 
 # REQUIREMENTS: BlenderNeko/ComfyUI Noise
@@ -1562,9 +1746,10 @@ class InjectNoiseHook(PixelKSampleHook):
         self.end_strength = end_strength
 
     def post_encode(self, samples):
-        # gen noise
+        cur_step = self.cur_step
+
         size = samples['samples'].shape
-        seed = self.cur_step + self.seed
+        seed = cur_step + self.seed + cur_step
 
         if "BNK_NoisyLatentImage" in nodes.NODE_CLASS_MAPPINGS and "BNK_InjectNoise" in nodes.NODE_CLASS_MAPPINGS:
             NoisyLatentImage = nodes.NODE_CLASS_MAPPINGS["BNK_NoisyLatentImage"]
@@ -1579,13 +1764,149 @@ class InjectNoiseHook(PixelKSampleHook):
         if 'noise_mask' in samples:
             mask = samples['noise_mask']
 
-        strength = self.start_strength + (self.end_strength - self.start_strength) * self.cur_step / self.total_step
+        strength = self.start_strength + (self.end_strength - self.start_strength) * cur_step / self.total_step
+        samples = InjectNoise().inject_noise(samples, strength, noise, mask)[0]
+        print(f"[Impact Pack] InjectNoiseHook: strength = {strength}")
+
+        if mask is not None:
+            samples['noise_mask'] = mask
+
+        return samples
+
+
+class UnsamplerHook(PixelKSampleHook):
+    def __init__(self, model, steps, start_end_at_step, end_end_at_step, cfg, sampler_name,
+                 scheduler, normalize, positive, negative):
+        super().__init__()
+        self.model = model
+        self.cfg = cfg
+        self.sampler_name = sampler_name
+        self.steps = steps
+        self.start_end_at_step = start_end_at_step
+        self.end_end_at_step = end_end_at_step
+        self.scheduler = scheduler
+        self.normalize = normalize
+        self.positive = positive
+        self.negative = negative
+
+    def post_encode(self, samples):
+        cur_step = self.cur_step
+
+        if "BNK_Unsampler" in nodes.NODE_CLASS_MAPPINGS:
+            Unsampler = nodes.NODE_CLASS_MAPPINGS["BNK_Unsampler"]
+        else:
+            raise Exception("'BNK_Unsampler' nodes are not installed.")
+
+        end_at_step = self.start_end_at_step + (self.end_end_at_step - self.start_end_at_step) * cur_step / self.total_step
+        end_at_step = int(end_at_step)
+
+        print(f"[Impact Pack] UnsamplerHook: end_at_step = {end_at_step}")
+
+        # inj noise
+        mask = None
+        if 'noise_mask' in samples:
+            mask = samples['noise_mask']
+
+        samples = Unsampler().unsampler(self.model, self.cfg, self.sampler_name, self.steps, end_at_step,
+                                        self.scheduler, self.normalize, self.positive, self.negative, samples)[0]
+
+        if mask is not None:
+            samples['noise_mask'] = mask
+
+        return samples
+
+
+class InjectNoiseHookForDetailer(DetailerHook):
+    def __init__(self, source, seed, start_strength, end_strength, from_start=False):
+        super().__init__()
+        self.source = source
+        self.seed = seed
+        self.start_strength = start_strength
+        self.end_strength = end_strength
+        self.from_start = from_start
+
+    def inject_noise(self, samples):
+        cur_step = self.cur_step if self.from_start else self.cur_step - 1
+        total_step = self.total_step if self.from_start else self.total_step - 1
+
+        size = samples['samples'].shape
+        seed = cur_step + self.seed + cur_step
+
+        if "BNK_NoisyLatentImage" in nodes.NODE_CLASS_MAPPINGS and "BNK_InjectNoise" in nodes.NODE_CLASS_MAPPINGS:
+            NoisyLatentImage = nodes.NODE_CLASS_MAPPINGS["BNK_NoisyLatentImage"]
+            InjectNoise = nodes.NODE_CLASS_MAPPINGS["BNK_InjectNoise"]
+        else:
+            raise Exception("'BNK_NoisyLatentImage', 'BNK_InjectNoise' nodes are not installed.")
+
+        noise = NoisyLatentImage().create_noisy_latents(self.source, seed, size[3] * 8, size[2] * 8, size[0])[0]
+
+        # inj noise
+        mask = None
+        if 'noise_mask' in samples:
+            mask = samples['noise_mask']
+
+        strength = self.start_strength + (self.end_strength - self.start_strength) * cur_step / total_step
         samples = InjectNoise().inject_noise(samples, strength, noise, mask)[0]
 
         if mask is not None:
             samples['noise_mask'] = mask
 
         return samples
+
+    def cycle_latent(self, latent):
+        if self.cur_step == 0 and not self.from_start:
+            return latent
+        else:
+            return self.inject_noise(latent)
+
+
+class UnsamplerDetailerHook(DetailerHook):
+    def __init__(self, model, steps, start_end_at_step, end_end_at_step, cfg, sampler_name,
+                 scheduler, normalize, positive, negative, from_start=False):
+        super().__init__()
+        self.model = model
+        self.cfg = cfg
+        self.sampler_name = sampler_name
+        self.steps = steps
+        self.start_end_at_step = start_end_at_step
+        self.end_end_at_step = end_end_at_step
+        self.scheduler = scheduler
+        self.normalize = normalize
+        self.positive = positive
+        self.negative = negative
+        self.from_start = from_start
+
+    def unsample(self, samples):
+        cur_step = self.cur_step if self.from_start else self.cur_step - 1
+        total_step = self.total_step if self.from_start else self.total_step - 1
+
+        if "BNK_Unsampler" in nodes.NODE_CLASS_MAPPINGS:
+            Unsampler = nodes.NODE_CLASS_MAPPINGS["BNK_Unsampler"]
+        else:
+            raise Exception("'BNK_Unsampler' nodes are not installed.")
+
+        end_at_step = self.start_end_at_step + (self.end_end_at_step - self.start_end_at_step) * cur_step / total_step
+        end_at_step = int(end_at_step)
+
+        # inj noise
+        mask = None
+        if 'noise_mask' in samples:
+            mask = samples['noise_mask']
+
+        samples = Unsampler().unsampler(self.model, self.cfg, self.sampler_name, self.steps, end_at_step,
+                                        self.scheduler, self.normalize, self.positive, self.negative, samples)[0]
+
+        if mask is not None:
+            samples['noise_mask'] = mask
+
+        return samples
+
+    def cycle_latent(self, latent):
+        if self.cur_step == 0 and not self.from_start:
+            return latent
+        else:
+            return self.unsample(latent)
+
 
 # REQUIREMENTS: BlenderNeko/ComfyUI_TiledKSampler
 class TiledKSamplerWrapper:
@@ -1615,22 +1936,17 @@ class TiledKSamplerWrapper:
 
 
 class PixelTiledKSampleUpscaler:
-    params = None
-    upscale_model = None
-    tile_params = None
-    hook = None
-    is_tiled = True
-    tile_size = 512
-
     def __init__(self, scale_method, model, vae, seed, steps, cfg, sampler_name, scheduler, positive, negative,
                  denoise,
                  tile_width, tile_height, tiling_strategy,
                  upscale_model_opt=None, hook_opt=None, tile_size=512):
         self.params = scale_method, model, vae, seed, steps, cfg, sampler_name, scheduler, positive, negative, denoise
+        self.vae = vae
         self.tile_params = tile_width, tile_height, tiling_strategy
         self.upscale_model = upscale_model_opt
         self.hook = hook_opt
         self.tile_size = tile_size
+        self.is_tiled = True
 
     def tiled_ksample(self, latent):
         if "BNK_TiledKSampler" in nodes.NODE_CLASS_MAPPINGS:
@@ -1709,8 +2025,7 @@ class BBoxDetectorBasedOnCLIPSeg:
     def detect(self, image, bbox_threshold, bbox_dilation, bbox_crop_factor, drop_size=1, detailer_hook=None):
         mask = self.detect_combined(image, bbox_threshold, bbox_dilation)
 
-        if len(mask.shape) == 3:
-            mask = mask.squeeze(0)
+        mask = make_2d_mask(mask)
 
         segs = mask_to_segs(mask, False, bbox_crop_factor, True, drop_size, detailer_hook=detailer_hook)
         return segs

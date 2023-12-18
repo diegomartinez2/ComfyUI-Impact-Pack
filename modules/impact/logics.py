@@ -1,4 +1,5 @@
 import sys
+import time
 
 import execution
 import folder_paths
@@ -41,6 +42,20 @@ class ImpactCompare:
             return (True, )
         else:
             return (False, )
+
+
+class ImpactNotEmptySEGS:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"segs": ("SEGS",)}}
+
+    FUNCTION = "doit"
+    CATEGORY = "ImpactPack/Logic"
+
+    RETURN_TYPES = ("BOOLEAN", )
+
+    def doit(self, segs):
+        return (segs[1] != [], )
 
 
 class ImpactConditionalBranch:
@@ -145,6 +160,9 @@ class ImpactValueSender:
                     "value": (any_typ, ),
                     "link_id": ("INT", {"default": 0, "min": 0, "max": sys.maxsize, "step": 1}),
                     },
+                "optional": {
+                        "signal_opt": (any_typ,),
+                    }
                 }
 
     OUTPUT_NODE = True
@@ -153,11 +171,12 @@ class ImpactValueSender:
 
     CATEGORY = "ImpactPack/Logic"
 
-    RETURN_TYPES = ()
+    RETURN_TYPES = (any_typ, )
+    RETURN_NAMES = ("signal", )
 
-    def doit(self, value, link_id=0):
+    def doit(self, value, link_id=0, signal_opt=None):
         PromptServer.instance.send_sync("value-send", {"link_id": link_id, "value": value})
-        return {}
+        return (signal_opt, )
 
 
 class ImpactIntConstSender:
@@ -275,6 +294,32 @@ class ImpactQueueTrigger:
         return (signal,)
 
 
+class ImpactQueueTriggerCountdown:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+                    "signal": (any_typ,),
+                    "count": ("INT", {"default": 10, "min": 0, "max": 0xffffffffffffffff})
+                    },
+                "hidden": {"unique_id": "UNIQUE_ID"}
+                }
+
+    FUNCTION = "doit"
+
+    CATEGORY = "ImpactPack/Logic/_for_test"
+    RETURN_TYPES = (any_typ, "INT")
+    RETURN_NAMES = ("signal_opt", "count")
+    OUTPUT_NODE = True
+
+    def doit(self, signal, count, unique_id):
+        if count > 0:
+            PromptServer.instance.send_sync("impact-node-feedback",
+                                            {"node_id": unique_id, "widget_name": "count", "type": "int", "value": count-1})
+            PromptServer.instance.send_sync("impact-add-queue", {})
+
+        return (signal, count)
+
+
 class ImpactSetWidgetValue:
     @classmethod
     def INPUT_TYPES(cls):
@@ -317,7 +362,7 @@ class ImpactSetWidgetValue:
 
         if value is not None:
             PromptServer.instance.send_sync("impact-node-feedback",
-                                            {"id": node_id, "widget_name": widget_name, "type": kind, "value": value})
+                                            {"node_id": node_id, "widget_name": widget_name, "type": kind, "value": value})
 
         return (signal,)
 
@@ -340,7 +385,28 @@ class ImpactNodeSetMuteState:
     OUTPUT_NODE = True
 
     def doit(self, signal, node_id, set_state):
-        PromptServer.instance.send_sync("impact-node-mute-state", {"id": node_id, "is_active": set_state})
+        PromptServer.instance.send_sync("impact-node-mute-state", {"node_id": node_id, "is_active": set_state})
+        return (signal,)
+
+
+class ImpactSleep:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+                    "signal": (any_typ,),
+                    "seconds": ("FLOAT", {"default": 0.5, "min": 0, "max": 3600}),
+                    }
+                }
+
+    FUNCTION = "doit"
+
+    CATEGORY = "ImpactPack/Logic/_for_test"
+    RETURN_TYPES = (any_typ,)
+    RETURN_NAMES = ("signal_opt",)
+    OUTPUT_NODE = True
+
+    def doit(self, signal, seconds):
+        time.sleep(seconds)
         return (signal,)
 
 
@@ -361,7 +427,7 @@ try:
     sys.__comfyui_manager_register_message_collapse(filter_message)
 
 except Exception as e:
-    print(f"e: {e}")
+    print(f"[WARN] ComfyUI-Impact-Pack: `ComfyUI` or `ComfyUI-Manager` is an outdated version.")
     pass
 
 
@@ -375,12 +441,51 @@ def workflow_to_map(workflow):
 
     return nodes, links
 
+
+class ImpactRemoteBoolean:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+                    "node_id": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
+                    "widget_name": ("STRING", {"multiline": False}),
+                    "value": ("BOOLEAN", {"default": True, "label_on": "True", "label_off": "False"}),
+                    }}
+
+    FUNCTION = "doit"
+
+    CATEGORY = "ImpactPack/Logic/_for_test"
+    RETURN_TYPES = ()
+    OUTPUT_NODE = True
+
+    def doit(self, **kwargs):
+        return {}
+
+
+class ImpactRemoteInt:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+                    "node_id": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
+                    "widget_name": ("STRING", {"multiline": False}),
+                    "value": ("INT", {"default": 0, "min": -0xffffffffffffffff, "max": 0xffffffffffffffff}),
+                    }}
+
+    FUNCTION = "doit"
+
+    CATEGORY = "ImpactPack/Logic/_for_test"
+    RETURN_TYPES = ()
+    OUTPUT_NODE = True
+
+    def doit(self, **kwargs):
+        return {}
+
 class ImpactControlBridge:
     @classmethod
     def INPUT_TYPES(cls):
         return {"required": {
                       "value": (any_typ,),
-                      "mode": ("BOOLEAN", {"default": True, "label_on": "pass", "label_off": "block"}),
+                      "mode": ("BOOLEAN", {"default": True, "label_on": "Active", "label_off": "Mute/Bypass"}),
+                      "behavior": ("BOOLEAN", {"default": True, "label_on": "Mute", "label_off": "Bypass"}),
                     },
                 "hidden": {"unique_id": "UNIQUE_ID", "prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO"}
                 }
@@ -392,26 +497,47 @@ class ImpactControlBridge:
     RETURN_NAMES = ("value",)
     OUTPUT_NODE = True
 
-    def doit(self, value, mode, unique_id, prompt, extra_pnginfo):
+    def doit(self, value, mode, behavior=True, unique_id=None, prompt=None, extra_pnginfo=None):
         global error_skip_flag
 
         nodes, links = workflow_to_map(extra_pnginfo['workflow'])
 
-        outputs = [str(links[link][2]) for link in nodes[unique_id]['outputs'][0]['links']]
+        active_nodes = []
+        mute_nodes = []
+        bypass_nodes = []
 
-        prompt_set = set(prompt.keys())
-        output_set = set(outputs)
+        for link in nodes[unique_id]['outputs'][0]['links']:
+            node_id = str(links[link][2])
+            node_mode = nodes[node_id]['mode']
+
+            if node_mode == 0:
+                active_nodes.append(node_id)
+            elif node_mode == 2:
+                mute_nodes.append(node_id)
+            elif node_mode == 4:
+                bypass_nodes.append(node_id)
 
         if mode:
-            should_active_but_muted = output_set - prompt_set
-            if len(should_active_but_muted) > 0:
-                PromptServer.instance.send_sync("impact-bridge-continue", {"id": unique_id, 'actives': list(should_active_but_muted)})
+            # active
+            should_be_active_nodes = mute_nodes + bypass_nodes
+            if len(should_be_active_nodes) > 0:
+                PromptServer.instance.send_sync("impact-bridge-continue", {"node_id": unique_id, 'actives': list(should_be_active_nodes)})
                 error_skip_flag = True
                 raise Exception("IMPACT-PACK-SIGNAL: STOP CONTROL BRIDGE\nIf you see this message, your ComfyUI-Manager is outdated. Please update it.")
+
+        elif behavior:
+            # mute
+            should_be_mute_nodes = active_nodes + bypass_nodes
+            if len(should_be_mute_nodes) > 0:
+                PromptServer.instance.send_sync("impact-bridge-continue", {"node_id": unique_id, 'mutes': list(should_be_mute_nodes)})
+                error_skip_flag = True
+                raise Exception("IMPACT-PACK-SIGNAL: STOP CONTROL BRIDGE\nIf you see this message, your ComfyUI-Manager is outdated. Please update it.")
+
         else:
-            should_muted_but_active = prompt_set.intersection(output_set)
-            if len(should_muted_but_active) > 0:
-                PromptServer.instance.send_sync("impact-bridge-continue", {"id": unique_id, 'mutes': list(should_muted_but_active)})
+            # bypass
+            should_be_bypass_nodes = active_nodes + mute_nodes
+            if len(should_be_bypass_nodes) > 0:
+                PromptServer.instance.send_sync("impact-bridge-continue", {"node_id": unique_id, 'bypasses': list(should_be_bypass_nodes)})
                 error_skip_flag = True
                 raise Exception("IMPACT-PACK-SIGNAL: STOP CONTROL BRIDGE\nIf you see this message, your ComfyUI-Manager is outdated. Please update it.")
 

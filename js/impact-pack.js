@@ -2,6 +2,19 @@ import { ComfyApp, app } from "../../scripts/app.js";
 import { ComfyDialog, $el } from "../../scripts/ui.js";
 import { api } from "../../scripts/api.js";
 
+let wildcards_list = [];
+async function load_wildcards() {
+	let res = await api.fetchApi('/impact/wildcards/list');
+	let data = await res.json();
+	wildcards_list = data.data;
+}
+
+load_wildcards();
+
+export function get_wildcards_list() {
+	return wildcards_list;
+}
+
 // temporary implementation (copying from https://github.com/pythongosssss/ComfyUI-WD14-Tagger)
 // I think this should be included into master!!
 class ImpactProgressBadge {
@@ -113,6 +126,7 @@ function imgSendHandler(event) {
 					img.onload = (event) => {
 						nodes[i].imgs = [img];
 						nodes[i].size[1] = Math.max(200, nodes[i].size[1]);
+						app.canvas.setDirty(true);
 					};
 					img.src = `/view?filename=${data.filename}&type=${data.type}&subfolder=${data.subfolder}`+app.getPreviewFormatParam();
 				}
@@ -158,6 +172,9 @@ function valueSendHandler(event) {
                 if(typ == 'string') {
                     nodes[i].widgets[0].value = "STRING";
                 }
+                else if(typ == "boolean") {
+                    nodes[i].widgets[0].value = "BOOLEAN";
+                }
                 else if(typ != "number") {
                     nodes[i].widgets[0].value = typeof event.detail.value;
                 }
@@ -195,6 +212,68 @@ app.registerExtension({
 		if (nodeData.name == "IterativeLatentUpscale" || nodeData.name == "IterativeImageUpscale"
 		    || nodeData.name == "RegionalSampler"|| nodeData.name == "RegionalSamplerAdvanced") {
 			impactProgressBadge.addStatusHandler(nodeType);
+		}
+
+		if(nodeData.name == "ImpactControlBridge") {
+            const onConnectionsChange = nodeType.prototype.onConnectionsChange;
+            nodeType.prototype.onConnectionsChange = function (type, index, connected, link_info) {
+                if(!link_info || this.inputs[0].type != '*')
+                    return;
+
+				// assign type
+				let slot_type = '*';
+
+				if(type == 2) {
+					slot_type = link_info.type;
+				}
+				else {
+					const node = app.graph.getNodeById(link_info.origin_id);
+					slot_type = node.outputs[link_info.origin_slot].type;
+				}
+
+				this.inputs[0].type = slot_type;
+				this.outputs[0].type = slot_type;
+				this.outputs[0].label = slot_type;
+			}
+		}
+
+		if(nodeData.name == "ImpactConditionalBranch") {
+            const onConnectionsChange = nodeType.prototype.onConnectionsChange;
+            nodeType.prototype.onConnectionsChange = function (type, index, connected, link_info) {
+                if(!link_info || this.inputs[0].type != '*')
+                    return;
+
+				// assign type
+				let slot_type = '*';
+
+				if(type == 2) {
+					slot_type = link_info.type;
+				}
+				else {
+					const node = app.graph.getNodeById(link_info.origin_id);
+					slot_type = node.outputs[link_info.origin_slot].type;
+				}
+
+				this.inputs[0].type = slot_type;
+				this.inputs[1].type = slot_type;
+				this.outputs[0].type = slot_type;
+				this.outputs[0].label = slot_type;
+			}
+		}
+
+		if(nodeData.name == "ImpactCompare") {
+            const onConnectionsChange = nodeType.prototype.onConnectionsChange;
+            nodeType.prototype.onConnectionsChange = function (type, index, connected, link_info) {
+                if(!link_info || this.inputs[0].type != '*' || type == 2)
+                    return;
+
+				// assign type
+				const node = app.graph.getNodeById(link_info.origin_id);
+				let slot_type = node.outputs[link_info.origin_slot].type;
+
+				this.inputs[0].type = slot_type;
+				this.inputs[1].type = slot_type;
+			}
 		}
 
         if(nodeData.name === 'ImpactInversedSwitch') {
@@ -291,7 +370,9 @@ app.registerExtension({
         }
 
         if (nodeData.name === 'ImpactMakeImageList' || nodeData.name === 'ImpactMakeImageBatch' ||
-            nodeData.name === 'CombineRegionalPrompts' || nodeData.name === 'ImpactCombineConditionings' ||
+            nodeData.name === 'CombineRegionalPrompts' || 
+			nodeData.name === 'ImpactCombineConditionings' || nodeData.name === 'ImpactConcatConditionings' ||
+            nodeData.name === 'ImpactSEGSConcat' ||
             nodeData.name === 'ImpactSwitch' || nodeData.name === 'LatentSwitch' || nodeData.name == 'SEGSSwitch') {
             var input_name = "input";
 
@@ -301,11 +382,16 @@ app.registerExtension({
                 input_name = "image";
                 break;
 
+            case 'ImpactSEGSConcat':
+                input_name = "segs";
+                break;
+
             case 'CombineRegionalPrompts':
                 input_name = "regional_prompts";
                 break;
 
             case 'ImpactCombineConditionings':
+            case 'ImpactConcatConditionings':
                 input_name = "conditioning";
                 break;
 
@@ -483,18 +569,28 @@ app.registerExtension({
 			});
 		}
 
-		if(node.comfyClass == "ImpactWildcardEncode" || node.comfyClass == "ToDetailerPipe" || node.comfyClass == "ToDetailerPipeSDXL"
-		|| node.comfyClass == "EditDetailerPipe" || node.comfyClass == "BasicPipeToDetailerPipe" || node.comfyClass == "BasicPipeToDetailerPipeSDXL") {
+		if(
+		node.comfyClass == "ImpactWildcardEncode" || node.comfyClass == "ImpactWildcardProcessor"
+		|| node.comfyClass == "ToDetailerPipe" || node.comfyClass == "ToDetailerPipeSDXL"
+		|| node.comfyClass == "EditDetailerPipe" || node.comfyClass == "EditDetailerPipeSDXL"
+		|| node.comfyClass == "BasicPipeToDetailerPipe" || node.comfyClass == "BasicPipeToDetailerPipeSDXL") {
 			node._value = "Select the LoRA to add to the text";
 			node._wvalue = "Select the Wildcard to add to the text";
 
             var tbox_id = 0;
             var combo_id = 3;
+            var has_lora = true;
 
             switch(node.comfyClass){
                 case "ImpactWildcardEncode":
                     tbox_id = 0;
                     combo_id = 3;
+                    break;
+
+                case "ImpactWildcardProcessor":
+                    tbox_id = 0;
+                    combo_id = 4;
+                    has_lora = false;
                     break;
 
                 case "ToDetailerPipe":
@@ -516,45 +612,49 @@ app.registerExtension({
                                 if(node.widgets[tbox_id].value != '')
                                     node.widgets[tbox_id].value += ', '
 
-
 	                            node.widgets[tbox_id].value += value;
                             }
                         }
-
-						node._wvalue = value;
 					},
-				get: () => {
-                        return node._wvalue;
-					 }
+				get: () => { return "Select the Wildcard to add to the text"; }
 			});
 
-			Object.defineProperty(node.widgets[combo_id], "value", {
-				set: (value) => {
-				        const stackTrace = new Error().stack;
-                        if(stackTrace.includes('inner_value_change')) {
-                            if(value != "Select the LoRA to add to the text") {
-	                            let lora_name = value;
-	                            if (lora_name.endsWith('.safetensors')) {
-	                                lora_name = lora_name.slice(0, -12);
-	                            }
-
-	                            node.widgets[tbox_id].value += `<lora:${lora_name}>`;
-	                            if(node.widgets_values) {
-	                                node.widgets_values[tbox_id] = node.widgets[tbox_id].value;
-                                }
-                            }
-                        }
-
-						node._value = value;
-					},
-				get: () => {
-                        return node._value;
-					 }
+			Object.defineProperty(node.widgets[combo_id+1].options, "values", {
+			    set: (x) => {},
+			    get: () => {
+			    	return wildcards_list;
+			    }
 			});
 
+			if(has_lora) {
+				Object.defineProperty(node.widgets[combo_id], "value", {
+					set: (value) => {
+							const stackTrace = new Error().stack;
+							if(stackTrace.includes('inner_value_change')) {
+								if(value != "Select the LoRA to add to the text") {
+									let lora_name = value;
+									if (lora_name.endsWith('.safetensors')) {
+										lora_name = lora_name.slice(0, -12);
+									}
+
+									node.widgets[tbox_id].value += `<lora:${lora_name}>`;
+									if(node.widgets_values) {
+										node.widgets_values[tbox_id] = node.widgets[tbox_id].value;
+									}
+								}
+							}
+
+							node._value = value;
+						},
+
+					get: () => { return "Select the LoRA to add to the text"; }
+				});
+			}
 
 			// Preventing validation errors from occurring in any situation.
-			node.widgets[combo_id].serializeValue = () => { return "Select the LoRA to add to the text"; }
+			if(has_lora) {
+				node.widgets[combo_id].serializeValue = () => { return "Select the LoRA to add to the text"; }
+			}
 			node.widgets[combo_id+1].serializeValue = () => { return "Select the Wildcard to add to the text"; }
 		}
 
@@ -562,40 +662,9 @@ app.registerExtension({
 			node.widgets[0].inputEl.placeholder = "Wildcard Prompt (User input)";
 			node.widgets[1].inputEl.placeholder = "Populated Prompt (Will be generated automatically)";
 			node.widgets[1].inputEl.disabled = true;
-			node.widgets[0].dynamicPrompts = false;
-			node.widgets[1].dynamicPrompts = false;
 
-            let populate_getter = node.widgets[1].__lookupGetter__('value');
-            let populate_setter = node.widgets[1].__lookupSetter__('value');
-
-			const wildcard_text_widget = node.widgets.find((w) => w.name == 'wildcard_text');
 			const populated_text_widget = node.widgets.find((w) => w.name == 'populated_text');
 			const mode_widget = node.widgets.find((w) => w.name == 'mode');
-			const seed_widget = node.widgets.find((w) => w.name == 'seed');
-
-			let force_serializeValue = async (n,i) =>
-				{
-					if(!mode_widget.value) {
-						return populated_text_widget.value;
-					}
-					else {
-				        let wildcard_text = await wildcard_text_widget.serializeValue();
-
-						let response = await api.fetchApi(`/impact/wildcards`, {
-																method: 'POST',
-																headers: { 'Content-Type': 'application/json' },
-																body: JSON.stringify({text: wildcard_text, seed: seed_widget.value})
-															});
-
-						let populated = await response.json();
-
-						n.widgets_values[2] = false;
-						n.widgets_values[1] = populated.text;
-						populate_setter.call(populated_text_widget, populated.text);
-
-						return populated.text;
-					}
-				};
 
 			// mode combo
 			Object.defineProperty(mode_widget, "value", {
@@ -610,39 +679,6 @@ app.registerExtension({
 							return true;
 					 }
 			});
-
-            // to avoid conflict with presetText.js of pythongosssss
-			Object.defineProperty(populated_text_widget, "value", {
-				set: (value) => {
-				        const stackTrace = new Error().stack;
-                        if(!stackTrace.includes('serializeValue'))
-				            populate_setter.call(populated_text_widget, value);
-					},
-				get: () => {
-				        return populate_getter.call(populated_text_widget);
-					 }
-			});
-
-            wildcard_text_widget.serializeValue = (n,i) => {
-                if(node.inputs) {
-	                let link_id = node.inputs.find(x => x.name=="wildcard_text")?.link;
-	                if(link_id != undefined) {
-	                    let link = app.graph.links[link_id];
-	                    let input_widget = app.graph._nodes_by_id[link.origin_id].widgets[link.origin_slot];
-	                    if(input_widget.type == "customtext") {
-	                        return input_widget.value;
-	                    }
-	                }
-	                else {
-	                    return wildcard_text_widget.value;
-	                }
-                }
-                else {
-                    return wildcard_text_widget.value;
-                }
-            };
-
-            populated_text_widget.serializeValue = force_serializeValue;
 		}
 
 		if (node.comfyClass == "MaskPainter") {
