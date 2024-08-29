@@ -9,31 +9,31 @@ function load_image(str) {
 
 function getFileItem(baseType, path) {
 	try {
-	    let pathType = baseType;
+		let pathType = baseType;
 
-	    if (path.endsWith("[output]")) {
-	        pathType = "output";
-	        path = path.slice(0, -9);
-	    } else if (path.endsWith("[input]")) {
-	        pathType = "input";
-	        path = path.slice(0, -8);
-	    } else if (path.endsWith("[temp]")) {
-	        pathType = "temp";
-	        path = path.slice(0, -7);
-	    }
+		if (path.endsWith("[output]")) {
+			pathType = "output";
+			path = path.slice(0, -9);
+		} else if (path.endsWith("[input]")) {
+			pathType = "input";
+			path = path.slice(0, -8);
+		} else if (path.endsWith("[temp]")) {
+			pathType = "temp";
+			path = path.slice(0, -7);
+		}
 
-	    const subfolder = path.substring(0, path.lastIndexOf('/'));
-	    const filename = path.substring(path.lastIndexOf('/') + 1);
+		const subfolder = path.substring(0, path.lastIndexOf('/'));
+		const filename = path.substring(path.lastIndexOf('/') + 1);
 
-	    return {
-	        filename: filename,
-	        subfolder: subfolder,
-	        type: pathType
-	    };
-    }
-    catch(exception) {
-        return null;
-    }
+		return {
+			filename: filename,
+			subfolder: subfolder,
+			type: pathType
+		};
+	}
+	catch(exception) {
+		return null;
+	}
 }
 
 async function loadImageFromUrl(image, node_id, v, need_to_load) {
@@ -46,7 +46,7 @@ async function loadImageFromUrl(image, node_id, v, need_to_load) {
 		if(res.status == 200) {
 			let pb_id = await res.text();
 			if(need_to_load) {;
-				image.src = `view?filename=${item.filename}&type=${item.type}&subfolder=${item.subfolder}`;
+				image.src = api.apiURL(`/view?filename=${item.filename}&type=${item.type}&subfolder=${item.subfolder}`);
 			}
 			return pb_id;
 		}
@@ -63,7 +63,7 @@ async function loadImageFromId(image, v) {
 	let res = await api.fetchApi('/impact/get/pb_id_image?id='+v, { cache: "no-store" });
 	if(res.status == 200) {
 		let item = await res.json();
-		image.src = `view?filename=${item.filename}&type=${item.type}&subfolder=${item.subfolder}`;
+		image.src = api.apiURL(`/view?filename=${item.filename}&type=${item.type}&subfolder=${item.subfolder}`);
 		return true;
 	}
 
@@ -74,13 +74,16 @@ app.registerExtension({
 	name: "Comfy.Impact.img",
 
 	nodeCreated(node, app) {
-		if(node.comfyClass == "PreviewBridge") {
+		if(node.comfyClass == "PreviewBridge" || node.comfyClass == "PreviewBridgeLatent") {
 			let w = node.widgets.find(obj => obj.name === 'image');
 			node._imgs = [new Image()];
 			node.imageIndex = 0;
 
 			Object.defineProperty(w, 'value', {
 				async set(v) {
+					if(w._lock)
+						return;
+
 					const stackTrace = new Error().stack;
 					if(stackTrace.includes('presetText.js'))
 						return;
@@ -101,7 +104,9 @@ app.registerExtension({
 					}
 					else {
 						// from clipspace
+						w._lock = true;
 						w._value = await loadImageFromUrl(image, node.id, v, false);
+						w._lock = false;
 					}
 				},
 				get() {
@@ -176,7 +181,7 @@ app.registerExtension({
 
 			Object.defineProperty(node, 'imgs', {
 				set(v) {
-					if (!v[0].complete) {
+					if (v && !v[0].complete) {
 						let orig_onload = v[0].onload;
 						v[0].onload = function(v2) {
 							if(orig_onload)
@@ -204,7 +209,7 @@ app.registerExtension({
 
 							let res = api.fetchApi('/view/validate'+params, { cache: "no-store" }).then(response => response);
 							if(res.status == 200) {
-								image.src = 'view'+params;
+								image.src = api.apiURL('/view'+params);
 							}
 
 							this._img = [new Image()]; // placeholder
@@ -220,5 +225,5 @@ app.registerExtension({
 				}
 			});
 		}
-    }
+	}
 })

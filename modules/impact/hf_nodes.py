@@ -1,4 +1,3 @@
-from transformers import pipeline
 import comfy
 import re
 from impact.utils import *
@@ -31,6 +30,8 @@ class HF_TransformersClassifierProvider:
     CATEGORY = "ImpactPack/HuggingFace"
 
     def doit(self, preset_repo_id, manual_repo_id, device_mode):
+        from transformers import pipeline
+
         if preset_repo_id == 'Manual repo id':
             url = manual_repo_id
         else:
@@ -41,7 +42,7 @@ class HF_TransformersClassifierProvider:
         else:
             device = "cpu"
 
-        classifier = pipeline(model=url, device=device)
+        classifier = pipeline('image-classification', model=url, device=device)
 
         return (classifier,)
 
@@ -82,8 +83,9 @@ class SEGS_Classify:
                     }
                 }
 
-    RETURN_TYPES = ("SEGS", "SEGS",)
-    RETURN_NAMES = ("filtered_SEGS", "remained_SEGS",)
+    RETURN_TYPES = ("SEGS", "SEGS", "STRING")
+    RETURN_NAMES = ("filtered_SEGS", "remained_SEGS", "detected_labels")
+    OUTPUT_IS_LIST = (False, False, True)
 
     FUNCTION = "doit"
 
@@ -116,7 +118,7 @@ class SEGS_Classify:
         match = re.match(classify_expr_pattern, expr_str)
 
         if match is None:
-            return ((segs[0], []), segs)
+            return (segs[0], []), segs, []
 
         a = match.group(1)
         op = match.group(2)
@@ -127,6 +129,7 @@ class SEGS_Classify:
 
         classified = []
         remained_SEGS = []
+        provided_labels = set()
 
         for seg in segs[1]:
             cropped_image = None
@@ -141,6 +144,9 @@ class SEGS_Classify:
                 cropped_image = to_pil(cropped_image)
                 res = classifier(cropped_image)
                 classified.append((seg, res))
+
+                for x in res:
+                    provided_labels.add(x['label'])
             else:
                 remained_SEGS.append(seg)
 
@@ -179,4 +185,4 @@ class SEGS_Classify:
             else:
                 remained_SEGS.append(seg)
 
-        return ((segs[0], filtered_SEGS), (segs[0], remained_SEGS))
+        return (segs[0], filtered_SEGS), (segs[0], remained_SEGS), list(provided_labels)
