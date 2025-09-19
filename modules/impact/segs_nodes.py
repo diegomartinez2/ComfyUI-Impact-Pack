@@ -4,7 +4,6 @@ import sys
 import impact.impact_server
 from nodes import MAX_RESOLUTION
 
-from impact.utils import *
 from . import core
 from .core import SEG
 import impact.utils as utils
@@ -12,12 +11,20 @@ from . import defs
 from . import segs_upscaler
 from comfy.cli_args import args
 import math
+from PIL import Image
+import comfy
+import numpy as np
+import torch
+import folder_paths
+import logging
 
+
+from typing import Callable, Union
 
 try:
     from comfy_extras import nodes_differential_diffusion
 except Exception:
-    print(f"\n#############################################\n[Impact Pack] ComfyUI is an outdated version.\n#############################################\n")
+    logging.info("\n#############################################\n[Impact Pack] ComfyUI is an outdated version.\n#############################################\n")
     raise Exception("[Impact Pack] ComfyUI is an outdated version.")
 
 
@@ -85,12 +92,12 @@ class SEGSDetailer:
             seed += 1
             for seg in segs[1]:
                 cropped_image = seg.cropped_image if seg.cropped_image is not None \
-                                                  else crop_ndarray4(image.numpy(), seg.crop_region)
-                cropped_image = to_tensor(cropped_image)
+                                                  else utils.crop_ndarray4(image.numpy(), seg.crop_region)
+                cropped_image = utils.to_tensor(cropped_image)
 
                 is_mask_all_zeros = (seg.cropped_mask == 0).all().item()
                 if is_mask_all_zeros:
-                    print(f"Detailer: segment skip [empty mask]")
+                    logging.info("Detailer: segment skip [empty mask]")
                     new_segs.append(seg)
                     continue
 
@@ -135,7 +142,7 @@ class SEGSDetailer:
                 else:
                     new_cropped_image = enhanced_image
 
-                new_seg = SEG(to_numpy(new_cropped_image), seg.cropped_mask, seg.confidence, seg.crop_region, seg.bbox, seg.label, None)
+                new_seg = SEG(utils.to_numpy(new_cropped_image), seg.cropped_mask, seg.confidence, seg.crop_region, seg.bbox, seg.label, None)
                 new_segs.append(new_seg)
 
         return (segs[0], new_segs), cnet_pil_list
@@ -154,7 +161,7 @@ class SEGSDetailer:
 
         # set fallback image
         if len(cnet_pil_list) == 0:
-            cnet_pil_list = [empty_pil_tensor()]
+            cnet_pil_list = [utils.empty_pil_tensor()]
 
         return segs, cnet_pil_list
 
@@ -196,12 +203,12 @@ class SEGSPaste:
                     ref_image = cropped_image[i].unsqueeze(0)
                 elif ref_image_opt is not None:
                     ref_tensor = ref_image_opt[i].unsqueeze(0)
-                    ref_image = crop_image(ref_tensor, seg.crop_region)
+                    ref_image = utils.crop_image(ref_tensor, seg.crop_region)
                 if ref_image is not None:
                     if seg.cropped_mask.ndim == 3 and len(seg.cropped_mask) == len(image):
                         mask = seg.cropped_mask[i]
                     elif seg.cropped_mask.ndim == 3 and len(seg.cropped_mask) > 1:
-                        print(f"[Impact Pack] WARN: SEGSPaste - The number of the mask batch({len(seg.cropped_mask)}) and the image batch({len(image)}) are different. Combine the mask frames and apply.")
+                        logging.warning(f"[Impact Pack] SEGSPaste: The number of the mask batch({len(seg.cropped_mask)}) and the image batch({len(image)}) are different. Combine the mask frames and apply.")
                         combined_mask = (seg.cropped_mask[0] * 255).to(torch.uint8)
 
                         for frame_mask in seg.cropped_mask[1:]:
@@ -212,14 +219,14 @@ class SEGSPaste:
                     else:  # ndim == 2
                         mask = seg.cropped_mask
 
-                    mask = tensor_gaussian_blur_mask(mask, feather) * (alpha/255)
+                    mask = utils.tensor_gaussian_blur_mask(mask, feather) * (alpha/255)
                     x, y, *_ = seg.crop_region
 
                     # ensure same device
                     mask = mask.to(image_i.device)
                     ref_image = ref_image.to(image_i.device)
 
-                    tensor_paste(image_i, ref_image, (x, y), mask)
+                    utils.tensor_paste(image_i, ref_image, (x, y), mask)
 
             if result is None:
                 result = image_i
@@ -263,7 +270,7 @@ class SEGSPreviewCNet:
                 cnet_image = seg.control_net_wrapper.control_image
                 result_image_list.append(cnet_image)
             else:
-                cnet_image = empty_pil_tensor(64, 64)
+                cnet_image = utils.empty_pil_tensor(64, 64)
 
             cnet_pil = utils.tensor2pil(cnet_image)
             cnet_pil.save(os.path.join(full_output_folder, file))
@@ -371,14 +378,14 @@ class SEGSPreview:
                     elif fallback_image_opt is not None:
                         # take from original image
                         ref_image = fallback_image_opt[i].unsqueeze(0)
-                        cropped_image = crop_image(ref_image, seg.crop_region)
+                        cropped_image = utils.crop_image(ref_image, seg.crop_region)
 
                     if cropped_image is not None:
                         if isinstance(cropped_image, np.ndarray):
                             cropped_image = torch.from_numpy(cropped_image)
 
                         cropped_image = cropped_image.clone()
-                        cropped_pil = to_pil(cropped_image)
+                        cropped_pil = utils.to_pil(cropped_image)
 
                         if alpha_mode:
                             if isinstance(seg.cropped_mask, np.ndarray):
@@ -481,7 +488,7 @@ class SEGSLabelAssign:
         labels = [label.strip() for label in labels]
 
         if len(labels) != len(segs[1]):
-            print(f'Warning (SEGSLabelAssign): length of labels ({len(labels)}) != length of segs ({len(segs[1])})')
+            logging.warning(f'[Impact Pack] SEGSLabelAssign: length of labels ({len(labels)}) != length of segs ({len(segs[1])})')
 
         labeled_segs = []
 
@@ -504,7 +511,7 @@ class SEGSOrderedFilter:
     def INPUT_TYPES(s):
         return {"required": {
                         "segs": ("SEGS", ),
-                        "target": (["area(=w*h)", "width", "height", "x1", "y1", "x2", "y2", "confidence"],),
+                        "target": (["area(=w*h)", "width", "height", "x1", "y1", "x2", "y2", "confidence", "none"],),
                         "order": ("BOOLEAN", {"default": True, "label_on": "descending", "label_off": "ascending"}),
                         "take_start": ("INT", {"default": 0, "min": 0, "max": sys.maxsize, "step": 1}),
                         "take_count": ("INT", {"default": 1, "min": 0, "max": sys.maxsize, "step": 1}),
@@ -517,51 +524,35 @@ class SEGSOrderedFilter:
 
     CATEGORY = "ImpactPack/Util"
 
+    @staticmethod
+    def get_sort_key_fn(target: str) -> Union[Callable, None]:
+        if target == "none":
+            return None
+
+        def sort_key_fn(seg):
+            x1, y1, x2, y2 = seg.crop_region
+            if target == "confidence": return seg.confidence
+            if target == "area(=w*h)": return (x2 - x1) * (y2 - y1)
+            if target == "width": return x2 - x1
+            if target == "height": return y2 - y1
+            if target == "x1": return x1
+            if target == "y1": return y1
+            if target == "x2": return x2
+            if target == "y2": return y2
+            raise Exception(f"[Impact Pack] SEGSOrderedFilter - Unexpected target '{target}'")
+
+        return sort_key_fn
+
     def doit(self, segs, target, order, take_start, take_count):
-        segs_with_order = []
+        sort_key_fn = SEGSOrderedFilter.get_sort_key_fn(target)
 
-        for seg in segs[1]:
-            x1 = seg.crop_region[0]
-            y1 = seg.crop_region[1]
-            x2 = seg.crop_region[2]
-            y2 = seg.crop_region[3]
+        sorted_list = list(segs[1]) # make a shallow copy, so it does not mutate the original list when sort
+        if sort_key_fn is not None:
+            sorted_list.sort(key=sort_key_fn, reverse=order)
 
-            if target == "area(=w*h)":
-                value = (y2 - y1) * (x2 - x1)
-            elif target == "width":
-                value = x2 - x1
-            elif target == "height":
-                value = y2 - y1
-            elif target == "x1":
-                value = x1
-            elif target == "x2":
-                value = x2
-            elif target == "y1":
-                value = y1
-            elif target == "y2":
-                value = y2
-            elif target == "confidence":
-                value = seg.confidence
-            else:
-                raise Exception(f"[Impact Pack] SEGSOrderedFilter - Unexpected target '{target}'")
-
-            segs_with_order.append((value, seg))
-
-        if order:
-            sorted_list = sorted(segs_with_order, key=lambda x: x[0], reverse=True)
-        else:
-            sorted_list = sorted(segs_with_order, key=lambda x: x[0], reverse=False)
-
-        result_list = []
-        remained_list = []
-
-        for i, item in enumerate(sorted_list):
-            if take_start <= i < take_start + take_count:
-                result_list.append(item[1])
-            else:
-                remained_list.append(item[1])
-
-        return (segs[0], result_list), (segs[0], remained_list),
+        take_stop = take_start + take_count
+        return (segs[0], sorted_list[take_start:take_stop]), \
+            (segs[0], sorted_list[:take_start] + sorted_list[take_stop:]),
 
 
 class SEGSRangeFilter:
@@ -598,7 +589,6 @@ class SEGSRangeFilter:
                 h = y2 - y1
                 w = x2 - x1
                 value = max(h/w, w/h)*100
-                print(f"value={value}")
             elif target == "width":
                 value = x2 - x1
             elif target == "height":
@@ -617,16 +607,121 @@ class SEGSRangeFilter:
                 raise Exception(f"[Impact Pack] SEGSRangeFilter - Unexpected target '{target}'")
 
             if mode and min_value <= value <= max_value:
-                print(f"[in] value={value} / {mode}, {min_value}, {max_value}")
+                logging.info(f"[in] value={value} / {mode}, {min_value}, {max_value}")
                 new_segs.append(seg)
             elif not mode and (value < min_value or value > max_value):
-                print(f"[out] value={value} / {mode}, {min_value}, {max_value}")
+                logging.info(f"[out] value={value} / {mode}, {min_value}, {max_value}")
                 new_segs.append(seg)
             else:
                 remained_segs.append(seg)
-                print(f"[filter] value={value} / {mode}, {min_value}, {max_value}")
+                logging.info(f"[filter] value={value} / {mode}, {min_value}, {max_value}")
 
         return (segs[0], new_segs), (segs[0], remained_segs),
+
+
+class SEGSIntersectionFilter:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+                        "segs1": ("SEGS", ),
+                        "segs2": ("SEGS", ),
+                        "ioa_threshold": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01}),
+                     },
+                }
+
+    RETURN_TYPES = ("SEGS",)
+    RETURN_NAMES = ("filtered_SEGS",)
+    FUNCTION = "doit"
+
+    CATEGORY = "ImpactPack/Util"
+
+    def compute_ioa(self, mask1, mask2):
+        """Compute Intersection over Area (IoA) between two boxes."""
+        inter_mask = utils.bitwise_and_masks(mask1, mask2)
+
+        inter_area = (inter_mask > 0).sum()
+        area1 = (mask1 > 0).sum()
+
+        return inter_area / area1 if area1 > 0 else 0
+
+    def doit(self, segs1, segs2, ioa_threshold):
+        """Remove segments from segs1 if their IoA with any segment in segs2 exceeds the threshold."""
+        # Extract bounding boxes for all segments in segs1 and segs2
+        keep = []
+
+        # Iterate over all segments in segs1
+        for idx1, seg1 in enumerate(segs1[1]):
+            keep_segment = True  # Assume the segment should be kept
+            mask1 = core.segs_to_combined_mask((segs1[0], [seg1]))
+
+            # Compare with every segment in segs2
+            for seg2 in segs2[1]:
+                mask2 = core.segs_to_combined_mask((segs2[0], [seg2]))
+                ioa = self.compute_ioa(mask1, mask2)  # IoA between segment 1 and segment 2
+
+                if ioa > ioa_threshold:  # If IoA exceeds the threshold, mark the segment for removal
+                    keep_segment = False
+                    break  # If one overlap exceeds threshold, break early and mark for removal
+
+            # Keep the segment if it did not exceed the threshold with any other segment
+            if keep_segment:
+                keep.append(segs1[1][idx1])
+
+        return (segs1[0], keep),  # Return the updated SEGS
+
+
+class SEGSNMSFilter:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "segs": ("SEGS",),
+                "iou_threshold": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01}),
+            },
+        }
+
+    RETURN_TYPES = ("SEGS",)
+    RETURN_NAMES = ("filtered_SEGS",)
+    FUNCTION = "doit"
+
+    CATEGORY = "ImpactPack/Util"
+
+    def compute_iou(self, mask1, mask2):
+        """Compute IoU between two bounding boxes (x1, y1, x2, y2)."""
+        inter_mask = utils.bitwise_and_masks(mask1, mask2)
+        union_mask = utils.add_masks(mask1, mask2)
+
+        inter_area = (inter_mask > 0).sum()
+        union_area = (union_mask > 0).sum()
+
+        return inter_area / union_area if union_area > 0 else 0
+
+    def doit(self, segs, iou_threshold):
+        """Perform NMS to filter overlapping segments."""
+        confidences = np.ndarray.flatten(np.array([seg.confidence for seg in segs[1]]))
+
+        # Sort boxes by confidence (high to low)
+        sorted_indices = np.argsort(confidences)[::-1].tolist()
+        keep = []
+
+        while len(sorted_indices) > 0:
+            idx = sorted_indices[0]
+            mask1 = core.segs_to_combined_mask((segs[0], [segs[1][idx]]))
+            keep.append(idx)
+            sorted_indices = sorted_indices[1:]
+
+            # Filter indices only contain the indices where the bbox does not intersect
+            filtered_indices = []
+            for i in sorted_indices:
+                mask2 = core.segs_to_combined_mask((segs[0], [segs[1][i]]))
+                iou = self.compute_iou(mask1, mask2)
+                if iou < iou_threshold:
+                    filtered_indices.append(i)
+
+            sorted_indices = np.array(filtered_indices)
+
+        filtered_segs = [segs[1][i] for i in keep]
+        return (segs[0], filtered_segs),
 
 
 class SEGSToImageList:
@@ -654,17 +749,17 @@ class SEGSToImageList:
 
         for seg in segs[1]:
             if seg.cropped_image is not None:
-                cropped_image = to_tensor(seg.cropped_image)
+                cropped_image = utils.to_tensor(seg.cropped_image)
             elif fallback_image_opt is not None:
                 # take from original image
-                cropped_image = to_tensor(crop_image(fallback_image_opt, seg.crop_region))
+                cropped_image = utils.to_tensor(utils.crop_image(fallback_image_opt, seg.crop_region))
             else:
-                cropped_image = empty_pil_tensor()
+                cropped_image = utils.empty_pil_tensor()
 
             results.append(cropped_image)
 
         if len(results) == 0:
-            results.append(empty_pil_tensor())
+            results.append(utils.empty_pil_tensor())
 
         return (results,)
 
@@ -762,7 +857,7 @@ class SEGSMerge:
             bbox_bottom = max(bbox_bottom, by2)
 
             min_confidence = min(min_confidence, seg.confidence)
-        
+
         combined_mask = core.segs_to_combined_mask(segs)
         cropped_mask = combined_mask[crop_top:crop_bottom, crop_left:crop_right]
         cropped_mask = cropped_mask.unsqueeze(0)
@@ -772,7 +867,7 @@ class SEGSMerge:
 
         seg = SEG(None, cropped_mask, min_confidence, crop_region, bbox, 'merged', None)
         return ((segs[0], [seg]),)
-        
+
 
 class SEGSConcat:
     @classmethod
@@ -802,7 +897,7 @@ class SEGSConcat:
                 if v[0] == dim:
                     res = res + v[1]
                 else:
-                    print(f"ERROR: source shape of 'segs1'{dim} and '{k}'{v[0]} are different. '{k}' will be ignored")
+                    logging.error(f"[Impact Pack] source shape of 'segs1'{dim} and '{k}'{v[0]} are different. '{k}' will be ignored")
 
         if dim is None:
             empty_segs = ((0, 0), [])
@@ -884,8 +979,8 @@ class From_SEG_ELT:
     CATEGORY = "ImpactPack/Util"
 
     def doit(self, seg_elt):
-        cropped_image = to_tensor(seg_elt.cropped_image) if seg_elt.cropped_image is not None else None
-        return (seg_elt, cropped_image, to_tensor(seg_elt.cropped_mask), seg_elt.crop_region, seg_elt.bbox, seg_elt.control_net_wrapper, seg_elt.confidence, seg_elt.label,)
+        cropped_image = utils.to_tensor(seg_elt.cropped_image) if seg_elt.cropped_image is not None else None
+        return (seg_elt, cropped_image, utils.to_tensor(seg_elt.cropped_mask), seg_elt.crop_region, seg_elt.bbox, seg_elt.control_net_wrapper, seg_elt.confidence, seg_elt.label,)
 
 
 class From_SEG_ELT_bbox:
@@ -988,7 +1083,7 @@ class DilateMask:
     CATEGORY = "ImpactPack/Util"
 
     def doit(self, mask, dilation):
-        mask = core.dilate_mask(mask.numpy(), dilation)
+        mask = utils.dilate_mask(mask.numpy(), dilation)
         mask = torch.from_numpy(mask)
         mask = utils.make_3d_mask(mask)
         return (mask, )
@@ -1011,7 +1106,7 @@ class GaussianBlurMask:
 
     def doit(self, mask, kernel_size, sigma):
         # Some custom nodes use abnormal 4-dimensional masks in the format of b, c, h, w. In the impact pack, internal 4-dimensional masks are required in the format of b, h, w, c. Therefore, normalization is performed using the normal mask format, which is 3-dimensional, before proceeding with the operation.
-        mask = make_3d_mask(mask)
+        mask = utils.make_3d_mask(mask)
         mask = torch.unsqueeze(mask, dim=-1)
         mask = utils.tensor_gaussian_blur_mask(mask, kernel_size, sigma)
         mask = torch.squeeze(mask, dim=-1)
@@ -1035,7 +1130,7 @@ class DilateMaskInSEGS:
     def doit(self, segs, dilation):
         new_segs = []
         for seg in segs[1]:
-            mask = core.dilate_mask(seg.cropped_mask, dilation)
+            mask = utils.dilate_mask(seg.cropped_mask, dilation)
             seg = SEG(seg.cropped_image, mask, seg.confidence, seg.crop_region, seg.bbox, seg.label, seg.control_net_wrapper)
             new_segs.append(seg)
 
@@ -1083,7 +1178,7 @@ class Dilate_SEG_ELT:
     CATEGORY = "ImpactPack/Util"
 
     def doit(self, seg, dilation):
-        mask = core.dilate_mask(seg.cropped_mask, dilation)
+        mask = utils.dilate_mask(seg.cropped_mask, dilation)
         seg = SEG(seg.cropped_image, mask, seg.confidence, seg.crop_region, seg.bbox, seg.label, seg.control_net_wrapper)
         return (seg,)
 
@@ -1252,7 +1347,7 @@ class MaskToSEGS:
 
     @staticmethod
     def doit(mask, combined, crop_factor, bbox_fill, drop_size, contour_fill=False):
-        mask = make_2d_mask(mask)
+        mask = utils.make_2d_mask(mask)
         result = core.mask_to_segs(mask, combined, crop_factor, bbox_fill, drop_size, is_contour=contour_fill)
 
         return (result, )
@@ -1279,13 +1374,13 @@ class MaskToSEGS_for_AnimateDiff:
     @staticmethod
     def doit(mask, combined, crop_factor, bbox_fill, drop_size, contour_fill=False):
         if (len(mask.shape) == 4 and mask.shape[1] > 1) or (len(mask.shape) == 3 and mask.shape[0] > 1):
-            mask = make_3d_mask(mask)
+            mask = utils.make_3d_mask(mask)
             if contour_fill:
-                print(f"[Impact Pack] MaskToSEGS_for_AnimateDiff: 'contour_fill' is ignored because batch mask 'contour_fill' is not supported.")
+                logging.info("[Impact Pack] MaskToSEGS_for_AnimateDiff: 'contour_fill' is ignored because batch mask 'contour_fill' is not supported.")
             result = core.batch_mask_to_segs(mask, combined, crop_factor, bbox_fill, drop_size)
             return (result, )
 
-        mask = make_2d_mask(mask)
+        mask = utils.make_2d_mask(mask)
         segs = core.mask_to_segs(mask, combined, crop_factor, bbox_fill, drop_size, is_contour=contour_fill)
         all_masks = SEGSToMaskList().doit(segs)[0]
 
@@ -1331,7 +1426,7 @@ class IPAdapterApplySEGS:
     def doit(segs, ipadapter_pipe, weight, noise, weight_type, start_at, end_at, unfold_batch, faceid_v2, weight_v2, context_crop_factor, reference_image, combine_embeds="concat", neg_image=None):
 
         if len(ipadapter_pipe) == 4:
-            print(f"[Impact Pack] IPAdapterApplySEGS: Installed Inspire Pack is outdated.")
+            logging.info("[Impact Pack] IPAdapterApplySEGS: Installed Inspire Pack is outdated.")
             raise Exception("Inspire Pack is outdated.")
 
         new_segs = []
@@ -1339,12 +1434,12 @@ class IPAdapterApplySEGS:
         h, w = segs[0]
 
         if reference_image.shape[2] != w or reference_image.shape[1] != h:
-            reference_image = tensor_resize(reference_image, w, h)
-        
+            reference_image = utils.tensor_resize(reference_image, w, h)
+
         for seg in segs[1]:
             # The context_crop_region sets how much wider the IPAdapter context will reflect compared to the crop_region, not the bbox
-            context_crop_region = make_crop_region(w, h, seg.crop_region, context_crop_factor)
-            cropped_image = crop_image(reference_image, context_crop_region)
+            context_crop_region = utils.make_crop_region(w, h, seg.crop_region, context_crop_factor)
+            cropped_image = utils.crop_image(reference_image, context_crop_region)
 
             control_net_wrapper = core.IPAdapterWrapper(ipadapter_pipe, weight, noise, weight_type, start_at, end_at, unfold_batch, weight_v2, cropped_image, neg_image=neg_image, prev_control_net=seg.control_net_wrapper, combine_embeds=combine_embeds)
             new_seg = SEG(seg.cropped_image, seg.cropped_mask, seg.confidence, seg.crop_region, seg.bbox, seg.label, control_net_wrapper)
@@ -1467,7 +1562,7 @@ class SEGSSwitch:
         if input_name in kwargs:
             return (kwargs[input_name],)
         else:
-            print(f"SEGSSwitch: invalid select index ('segs1' is selected)")
+            logging.info("SEGSSwitch: invalid select index ('segs1' is selected)")
             return (kwargs['segs1'],)
 
 
@@ -1504,9 +1599,9 @@ class SEGSPicker:
                 cropped_image = seg.cropped_image
             elif fallback_image_opt is not None:
                 # take from original image
-                cropped_image = crop_image(fallback_image_opt, seg.crop_region)
+                cropped_image = utils.crop_image(fallback_image_opt, seg.crop_region)
             else:
-                cropped_image = empty_pil_tensor()
+                cropped_image = utils.empty_pil_tensor()
 
             mask_array = seg.cropped_mask.copy()
             mask_array[mask_array < 0.3] = 0.3
@@ -1570,7 +1665,7 @@ class DefaultImageForSEGS:
                     for i in range(0, batch_count):
                         # take from original image
                         ref_image = image[i].unsqueeze(0)
-                        cropped_image2 = crop_image(ref_image, seg.crop_region)
+                        cropped_image2 = utils.crop_image(ref_image, seg.crop_region)
 
                         if cropped_image is None:
                             cropped_image = cropped_image2
@@ -1637,7 +1732,7 @@ class MakeTileSEGS:
     def doit(images, bbox_size, crop_factor, min_overlap, filter_segs_dilation, mask_irregularity=0, irregular_mask_mode="Reuse fast", filter_in_segs_opt=None, filter_out_segs_opt=None):
         if bbox_size <= 2*min_overlap:
             new_min_overlap = bbox_size / 2
-            print(f"[MakeTileSEGS] min_overlap should be greater than bbox_size. (value changed: {min_overlap} => {new_min_overlap})")
+            logging.info(f"[MakeTileSEGS] min_overlap should be greater than bbox_size. (value changed: {min_overlap} => {new_min_overlap})")
             min_overlap = new_min_overlap
 
         _, ih, iw, _ = images.size()
@@ -1667,7 +1762,7 @@ class MakeTileSEGS:
             exclusion_mask = core.segs_to_combined_mask(filter_out_segs_opt)
             exclusion_mask = utils.make_3d_mask(exclusion_mask)
             exclusion_mask = utils.resize_mask(exclusion_mask, (ih, iw))
-            exclusion_mask = dilate_mask(exclusion_mask.cpu().numpy(), filter_segs_dilation)
+            exclusion_mask = utils.dilate_mask(exclusion_mask.cpu().numpy(), filter_segs_dilation)
         else:
             exclusion_mask = None
 
@@ -1675,7 +1770,7 @@ class MakeTileSEGS:
             and_mask = core.segs_to_combined_mask(filter_in_segs_opt)
             and_mask = utils.make_3d_mask(and_mask)
             and_mask = utils.resize_mask(and_mask, (ih, iw))
-            and_mask = dilate_mask(and_mask.cpu().numpy(), filter_segs_dilation)
+            and_mask = utils.dilate_mask(and_mask.cpu().numpy(), filter_segs_dilation)
 
             a, b = core.mask_to_segs(and_mask, True, 1.0, False, 0)
             if len(b) == 0:
@@ -1693,7 +1788,7 @@ class MakeTileSEGS:
         # calculate tile factors
         if bbox_size > h or bbox_size > w:
             new_bbox_size = min(bbox_size, min(w, h))
-            print(f"[MaskTileSEGS] bbox_size is greater than resolution (value changed: {bbox_size} => {new_bbox_size}")
+            logging.info(f"[MaskTileSEGS] bbox_size is greater than resolution (value changed: {bbox_size} => {new_bbox_size}")
             bbox_size = new_bbox_size
 
         n_horizontal = math.ceil(w / (bbox_size - min_overlap))
@@ -1741,7 +1836,7 @@ class MakeTileSEGS:
                     y1 = ih-bbox_size
 
                 bbox = x1, y1, x2, y2
-                crop_region = make_crop_region(iw, ih, bbox, crop_factor)
+                crop_region = utils.make_crop_region(iw, ih, bbox, crop_factor)
                 cx1, cy1, cx2, cy2 = crop_region
 
                 mask = np.zeros((cy2 - cy1, cx2 - cx1)).astype(np.float32)
@@ -1850,14 +1945,14 @@ class SEGSUpscaler:
         ordered_segs = segs[1]
 
         for i, seg in enumerate(ordered_segs):
-            cropped_image = crop_ndarray4(new_image.numpy(), seg.crop_region)
-            cropped_image = to_tensor(cropped_image)
-            mask = to_tensor(seg.cropped_mask)
-            mask = tensor_gaussian_blur_mask(mask, feather)
+            cropped_image = utils.crop_ndarray4(new_image.numpy(), seg.crop_region)
+            cropped_image = utils.to_tensor(cropped_image)
+            mask = utils.to_tensor(seg.cropped_mask)
+            mask = utils.tensor_gaussian_blur_mask(mask, feather)
 
             is_mask_all_zeros = (seg.cropped_mask == 0).all().item()
             if is_mask_all_zeros:
-                print(f"SEGSUpscaler: segment skip [empty mask]")
+                logging.info("SEGSUpscaler: segment skip [empty mask]")
                 continue
 
             cropped_mask = seg.cropped_mask
@@ -1868,17 +1963,17 @@ class SEGSUpscaler:
                                                         positive, negative, denoise,
                                                         noise_mask=cropped_mask, control_net_wrapper=seg.control_net_wrapper,
                                                         inpaint_model=inpaint_model, noise_mask_feather=noise_mask_feather, scheduler_func_opt=scheduler_func_opt)
-            if not (enhanced_image is None):
+            if enhanced_image is not None:
                 new_image = new_image.cpu()
                 enhanced_image = enhanced_image.cpu()
                 left = seg.crop_region[0]
                 top = seg.crop_region[1]
-                tensor_paste(new_image, enhanced_image, (left, top), mask)
+                utils.tensor_paste(new_image, enhanced_image, (left, top), mask)
 
                 if upscaler_hook_opt is not None:
                     new_image = upscaler_hook_opt.post_paste(new_image)
 
-        enhanced_img = tensor_convert_rgb(new_image)
+        enhanced_img = utils.tensor_convert_rgb(new_image)
 
         return (enhanced_img,)
 

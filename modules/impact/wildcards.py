@@ -8,6 +8,7 @@ import numpy as np
 import threading
 from impact import utils
 from impact import config
+import logging
 
 
 wildcards_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "wildcards"))
@@ -65,13 +66,13 @@ def read_wildcard_dict(wildcard_path):
                     with open(file_path, 'r', encoding="UTF-8", errors="ignore") as f:
                         lines = f.read().splitlines()
                         wildcard_dict[key] = [x for x in lines if not x.strip().startswith('#')]
-            elif file.endswith('.yaml'):
+            elif file.endswith('.yaml') or file.endswith('.yml'):
                 file_path = os.path.join(root, file)
 
                 try:
                     with open(file_path, 'r', encoding="ISO-8859-1") as f:
                         yaml_data = yaml.load(f, Loader=yaml.FullLoader)
-                except yaml.reader.ReaderError as e:
+                except yaml.reader.ReaderError:
                     with open(file_path, 'r', encoding="UTF-8", errors="ignore") as f:
                         yaml_data = yaml.load(f, Loader=yaml.FullLoader)
 
@@ -138,8 +139,8 @@ def process(text, seed=None):
                     if b is not None:
                         b = b.strip()
                     else:
-                        b = "-1"
-                        
+                        b = a
+
                 if r is not None:
                     if b is not None and is_numeric_string(a) and is_numeric_string(b):
                         # PATTERN: num1-num2
@@ -211,7 +212,7 @@ def process(text, seed=None):
                 selected_items = random_gen.choice(options, p=normalized_probabilities, size=select_count, replace=False)
 
             # x may be numpy.int32, convert to string
-            selected_items2 = [re.sub(r'^\s*[0-9.]+::', '', str(x), 1) for x in selected_items]
+            selected_items2 = [re.sub(r'^\s*[0-9.]+::', '', str(x), count=1) for x in selected_items]
             replacement = select_sep.join(selected_items2)
             if '::' in replacement:
                 pass
@@ -219,7 +220,7 @@ def process(text, seed=None):
             replacements_found = True
             return replacement
 
-        pattern = r'{([^{}]*?)}'
+        pattern = r'(?<!\\)\{((?:[^{}]|(?<=\\)[{}])*?)(?<!\\)\}'
         replaced_string = re.sub(pattern, replace_option, string)
 
         return replaced_string, replacements_found
@@ -278,7 +279,7 @@ def process(text, seed=None):
 
                 normalized_probabilities = [prob / total_prob for prob in adjusted_probabilities]
                 selected_item = random_gen.choice(options, p=normalized_probabilities, replace=False)
-                replacement = re.sub(r'^\s*[0-9.]+::', '', selected_item, 1)
+                replacement = re.sub(r'^\s*[0-9.]+::', '', selected_item, count=1)
                 replacements_found = True
                 string = string.replace(f"__{match}__", replacement, 1)
             elif '*' in keyword:
@@ -304,7 +305,7 @@ def process(text, seed=None):
     stop_unwrap = False
     while not stop_unwrap and replace_depth > 1:
         replace_depth -= 1  # prevent infinite loop
-        
+
         option_quantifier = [e.groupdict() for e in RE_WildCardQuantifier.finditer(text)]
         for match in option_quantifier:
             keyword = match['keyword'].lower()
@@ -358,6 +359,7 @@ def extract_lora_values(string):
         lbw = None
         lbw_a = None
         lbw_b = None
+        loader = None
 
         if len(item) > 0:
             lora = item[0]
@@ -376,6 +378,8 @@ def extract_lora_values(string):
                             lbw_b = safe_float(lbw_item[2:].strip())
                         elif lbw_item.strip() != '':
                             lbw = lbw_item
+                elif sub_item.startswith("LOADER="):
+                    loader = sub_item[7:]
 
         if a is None:
             a = 1.0
@@ -383,7 +387,7 @@ def extract_lora_values(string):
             b = a
 
         if lora is not None and lora not in added:
-            result.append((lora, a, b, lbw, lbw_a, lbw_b))
+            result.append((lora, a, b, lbw, lbw_a, lbw_b, loader))
             added.add(lora)
 
     return result
@@ -407,6 +411,8 @@ def resolve_lora_name(lora_name_cache, name):
             if x.endswith(name):
                 return x
 
+    return None
+
 
 def process_with_loras(wildcard_opt, model, clip, clip_encoder=None, seed=None, processed=None):
     """
@@ -427,7 +433,7 @@ def process_with_loras(wildcard_opt, model, clip, clip_encoder=None, seed=None, 
     loras = extract_lora_values(pass1)
     pass2 = remove_lora_tags(pass1)
 
-    for lora_name, model_weight, clip_weight, lbw, lbw_a, lbw_b in loras:
+    for lora_name, model_weight, clip_weight, lbw, lbw_a, lbw_b, loader in loras:
         lora_name_ext = lora_name.split('.')
         if ('.'+lora_name_ext[-1]) not in folder_paths.supported_pt_extensions:
             lora_name = lora_name+".safetensors"
@@ -441,26 +447,36 @@ def process_with_loras(wildcard_opt, model, clip, clip_encoder=None, seed=None, 
             path = None
 
         if path is not None:
-            print(f"LOAD LORA: {lora_name}: {model_weight}, {clip_weight}, LBW={lbw}, A={lbw_a}, B={lbw_b}")
+            logging.info(f"LOAD LORA: {lora_name}: {model_weight}, {clip_weight}, LBW={lbw}, A={lbw_a}, B={lbw_b}, LOADER={loader}")
 
-            def default_lora():
-                return nodes.LoraLoader().load_lora(model, clip, lora_name, model_weight, clip_weight)
-
-            if lbw is not None:
-                if 'LoraLoaderBlockWeight //Inspire' not in nodes.NODE_CLASS_MAPPINGS:
-                    utils.try_install_custom_node(
-                        'https://github.com/ltdrdata/ComfyUI-Inspire-Pack',
-                        "To use 'LBW=' syntax in wildcards, 'Inspire Pack' extension is required.")
-
-                    print(f"'LBW(Lora Block Weight)' is given, but the 'Inspire Pack' is not installed. The LBW= attribute is being ignored.")
-                    model, clip = default_lora()
+            if loader is not None:
+                if loader == 'nunchaku':
+                    if 'NunchakuFluxLoraLoader' not in nodes.NODE_CLASS_MAPPINGS:
+                        logging.warning("To use `LOADER=nunchaku`, 'ComfyUI-nunchaku' is required. The LOADER= attribute is being ignored.")
+                    cls = nodes.NODE_CLASS_MAPPINGS['NunchakuFluxLoraLoader']
+                    model = cls().load_lora(model, lora_name, model_weight)[0]
                 else:
-                    cls = nodes.NODE_CLASS_MAPPINGS['LoraLoaderBlockWeight //Inspire']
-                    model, clip, _ = cls().doit(model, clip, lora_name, model_weight, clip_weight, False, 0, lbw_a, lbw_b, "", lbw)
+                    logging.warning(f"LORA LOADER NOT FOUND: '{loader}'")
             else:
-                model, clip = default_lora()
+                def default_lora():
+                    return nodes.LoraLoader().load_lora(model, clip, lora_name, model_weight, clip_weight)
+
+                if lbw is not None:
+                    if 'LoraLoaderBlockWeight //Inspire' not in nodes.NODE_CLASS_MAPPINGS:
+                        utils.try_install_custom_node(
+                            'https://github.com/ltdrdata/ComfyUI-Inspire-Pack',
+                            "To use 'LBW=' syntax in wildcards, 'Inspire Pack' extension is required.")
+
+                        logging.warning("'LBW(Lora Block Weight)' is given, but the 'Inspire Pack' is not installed. The LBW= attribute is being ignored.")
+                        model, clip = default_lora()
+                    else:
+                        cls = nodes.NODE_CLASS_MAPPINGS['LoraLoaderBlockWeight //Inspire']
+                        model, clip, _ = cls().doit(model, clip, lora_name, model_weight, clip_weight, False, 0, lbw_a, lbw_b, "", lbw)
+
+                else:
+                    model, clip = default_lora()
         else:
-            print(f"LORA NOT FOUND: {orig_lora_name}")
+            logging.warning(f"LORA NOT FOUND: {orig_lora_name}")
 
     pass3 = [x.strip() for x in pass2.split("BREAK")]
     pass3 = [x for x in pass3 if x != '']
@@ -469,7 +485,7 @@ def process_with_loras(wildcard_opt, model, clip, clip_encoder=None, seed=None, 
         pass3 = ['']
 
     pass3_str = [f'[{x}]' for x in pass3]
-    print(f"CLIP: {str.join(' + ', pass3_str)}")
+    logging.info(f"CLIP: {str.join(' + ', pass3_str)}")
 
     result = None
 
@@ -556,7 +572,7 @@ def split_string_with_sep(input_string):
             else:
                 try:
                     seed = int(matches[i][5:-1])
-                except:
+                except Exception:
                     seed = None
                 result_list.append(seed)
 
@@ -602,7 +618,7 @@ def wildcard_load():
 
         try:
             read_wildcard_dict(config.get_config()['custom_wildcards'])
-        except Exception as e:
-            print(f"[Impact Pack] Failed to load custom wildcards directory.")
+        except Exception:
+            logging.info("[Impact Pack] Failed to load custom wildcards directory.")
 
-        print(f"[Impact Pack] Wildcards loading done.")
+        logging.info("[Impact Pack] Wildcards loading done.")

@@ -12,12 +12,12 @@ import torchvision
 import impact.core as core
 import impact.impact_pack as impact_pack
 from impact.utils import to_tensor
+import impact.utils as utils
 from segment_anything import SamPredictor, sam_model_registry
 import numpy as np
 import nodes
 from PIL import Image
 import io
-import impact.wildcards as wildcards
 import comfy
 from io import BytesIO
 import random
@@ -109,7 +109,8 @@ async def release_sam(request):
     global sam_predictor
 
     with sam_lock:
-        del sam_predictor
+        temp = sam_predictor
+        del temp
         sam_predictor = None
 
     logging.info("[Impact Pack]: unloading SAM model")
@@ -145,7 +146,7 @@ async def sam_detect(request):
                     plabs.append(0)
 
                 detected_masks = core.sam_predict(sam_predictor, points, plabs, None, threshold)
-                mask = core.combine_masks2(detected_masks)
+                mask = utils.combine_masks2(detected_masks)
 
                 if mask is None:
                     return web.Response(status=400)
@@ -183,7 +184,7 @@ async def wildcards_list(request):
 @PromptServer.instance.routes.post("/impact/wildcards")
 async def populate_wildcards(request):
     data = await request.json()
-    populated = wildcards.process(data['text'], data.get('seed', None))
+    populated = impact.wildcards.process(data['text'], data.get('seed', None))
     return web.json_response({"text": populated})
 
 
@@ -239,7 +240,7 @@ async def view_validate(request):
 
 
 @PromptServer.instance.routes.get("/impact/validate/pb_id_image")
-async def view_validate(request):
+async def view_pb_id_image(request):
     if "id" in request.rel_url.query:
         pb_id = request.rel_url.query["id"]
 
@@ -309,7 +310,7 @@ async def view_previewbridge_image(request):
         if pb_id in core.preview_bridge_image_id_map:
             file = core.preview_bridge_image_id_map[pb_id]
 
-            with Image.open(file) as img:
+            with Image.open(file):
                 filename = os.path.basename(file)
                 return web.FileResponse(file, headers={"Content-Disposition": f"filename=\"{filename}\""})
 
@@ -373,7 +374,7 @@ def onprompt_for_switch(json_data):
                         if 'BOOLEAN' == input_node['inputs']['typ']:
                             try:
                                 onprompt_cond_branch_info[k] = input_node['inputs']['value'].lower() == "true"
-                            except:
+                            except Exception:
                                 pass
                 else:
                     onprompt_cond_branch_info[k] = cond_input
@@ -507,17 +508,17 @@ def onprompt_populate_wildcards(json_data):
                         else:
                             logging.info(f"[Impact Pack] Only `ImpactInt`, `Seed (rgthree)` and `Primitive` Node are allowed as the seed for '{v['class_type']}'. It will be ignored. ")
                             continue
-                    except:
+                    except Exception:
                         continue
                 else:
                     input_seed = int(inputs['seed'])
 
-                inputs['populated_text'] = wildcards.process(inputs['wildcard_text'], input_seed)
+                inputs['populated_text'] = impact.wildcards.process(inputs['wildcard_text'], input_seed)
                 inputs['mode'] = 'reproduce'
 
                 PromptServer.instance.send_sync("impact-node-feedback", {"node_id": k, "widget_name": "populated_text", "type": "STRING", "value": inputs['populated_text']})
                 updated_widget_values[k] = inputs['populated_text']
-            
+
             if inputs['mode'] == 'reproduce':
                 PromptServer.instance.send_sync("impact-node-feedback", {"node_id": k, "widget_name": "mode", "type": "STRING", "value": 'populate'})
 

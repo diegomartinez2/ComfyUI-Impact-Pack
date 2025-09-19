@@ -8,7 +8,8 @@ from impact.utils import any_typ
 import impact.core as core
 import re
 import nodes
-import traceback
+import logging
+
 
 class ImpactCompare:
     @classmethod
@@ -115,7 +116,6 @@ class ImpactConditionalBranchSelMode:
     RETURN_TYPES = (any_typ, )
 
     def doit(self, cond, tt_value=None, ff_value=None, **kwargs):
-        print(f'tt={tt_value is None}\nff={ff_value is None}')
         if cond:
             return (tt_value,)
         else:
@@ -574,27 +574,6 @@ class ImpactSleep:
         return (signal,)
 
 
-error_skip_flag = False
-try:
-    import cm_global
-    def filter_message(str):
-        global error_skip_flag
-
-        if "IMPACT-PACK-SIGNAL: STOP CONTROL BRIDGE" in str:
-            return True
-        elif error_skip_flag and "ERROR:root:!!! Exception during processing !!!\n" == str:
-            error_skip_flag = False
-            return True
-        else:
-            return False
-
-    cm_global.try_call(api='cm.register_message_collapse', f=filter_message)
-
-except Exception as e:
-    print(f"[WARN] ComfyUI-Impact-Pack: `ComfyUI` or `ComfyUI-Manager` is an outdated version.")
-    pass
-
-
 def workflow_to_map(workflow):
     nodes = {}
     links = {}
@@ -675,8 +654,8 @@ class ImpactControlBridge:
             #       so extra_pnginfo is useless in here
             try:
                 workflow = core.current_prompt['extra_data']['extra_pnginfo']['workflow']
-            except:
-                print(f"[Impact Pack] core.current_prompt['extra_data']['extra_pnginfo']['workflow']")
+            except Exception:
+                logging.info("[Impact Pack] core.current_prompt['extra_data']['extra_pnginfo']['workflow']")
                 return 0
 
             nodes, links = workflow_to_map(workflow)
@@ -694,7 +673,7 @@ class ImpactControlBridge:
         if core.is_execution_model_version_supported():
             from comfy_execution.graph import ExecutionBlocker
         else:
-            print("[Impact Pack] ImpactControlBridge: ComfyUI is outdated. The 'Stop' behavior cannot function properly.")
+            logging.info("[Impact Pack] ImpactControlBridge: ComfyUI is outdated. The 'Stop' behavior cannot function properly.")
 
         if behavior == "Stop":
             if mode:
@@ -702,7 +681,7 @@ class ImpactControlBridge:
             else:
                 return (ExecutionBlocker(None), )
         elif extra_pnginfo is None:
-            logging.warn(f"[Impact Pack] limitation: '{behavior}' behavior cannot be used in API execution.")
+            logging.warning(f"[Impact Pack] limitation: '{behavior}' behavior cannot be used in API execution.")
             return (value,)
         else:
             workflow_nodes, links = workflow_to_map(extra_pnginfo['workflow'])
@@ -734,7 +713,7 @@ class ImpactControlBridge:
                     PromptServer.instance.send_sync("impact-bridge-continue", {"node_id": unique_id, 'actives': list(should_be_active_nodes)})
                     nodes.interrupt_processing()
 
-            elif behavior == "Mute" or behavior == True:
+            elif behavior == "Mute" or behavior == True:  # noqa: E712
                 # mute
                 should_be_mute_nodes = active_nodes + bypass_nodes
                 if len(should_be_mute_nodes) > 0:
